@@ -26,7 +26,9 @@ else
 fi
 
 if [ "$ENABLE_SHIM" = "1" ] && [ -x ./e2b-shim/target/release/e2b-shim ]; then
-  tmux split-window -t "$SESSION" "exec ./e2b-shim/target/release/e2b-shim 2>&1 | sed 's/^/[shim] /' | tee -a /opt/inspect-api/shim.log"
+  # Wrap shim launch so .env (REGISTRY_*, TOS_*) is sourced inside the tmux pane too.
+  shim_cmd='if [ -f /opt/inspect-api/.env ]; then set -a; . /opt/inspect-api/.env; set +a; fi; exec ./e2b-shim/target/release/e2b-shim'
+  tmux split-window -t "$SESSION" "bash -c \"$shim_cmd\" 2>&1 | sed 's/^/[shim] /' | tee -a /opt/inspect-api/shim.log"
   tmux select-layout -t "$SESSION" tiled
   echo "started e2b-shim in same tmux session (pane added)"
 fi
