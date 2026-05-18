@@ -401,6 +401,71 @@ message ExecResult {
 `/exec_hot` JSON gains `persist_changes: bool` (default false) and returns `output_files` /
 `deleted_files` only when non-empty.
 
+## Container registry + TOS storage
+
+Optional integrations driven entirely by env vars in `.env` (copy from
+`.env.example`; the file is gitignored — never commit secrets). All features
+are opt-in; nothing breaks when env vars are absent.
+
+### Push template images to Volcano CR
+
+```bash
+cp .env.example .env  # fill REGISTRY_HOST / REGISTRY_NAMESPACE / REGISTRY_USER / REGISTRY_PASSWORD
+docker login $REGISTRY_HOST  # one-time, uses the credentials interactively
+
+set -a; source .env; set +a
+./template-builder/target/release/template-build --push default
+# → builds inspect-tpl-default:latest, then:
+#   docker tag  inspect-tpl-default:latest \
+#               image-mindverse-cn-beijing.cr.volces.com/sandboxes/inspect-tpl-default:latest
+#   docker push image-mindverse-cn-beijing.cr.volces.com/sandboxes/inspect-tpl-default:latest
+```
+
+`--push-tag X` overrides the default `latest`.
+
+### Worker stdout/stderr offload to TOS
+
+When a child's stdout or stderr exceeds `WORKER_STDOUT_S3_THRESHOLD` bytes,
+boto3 inside the worker uploads the buffer to TOS and the API response carries
+an `s3://` URL instead of inline text. Configured purely through `.env`:
+
+```
+TOS_BUCKET=tos-mindverse
+TOS_S3_ENDPOINT=https://tos-s3-cn-beijing.ivolces.com
+TOS_REGION=cn-beijing
+TOS_ACCESS_KEY=...
+TOS_SECRET_KEY=...
+
+WORKER_STDOUT_S3_THRESHOLD=65536        # 64 KiB; 0 disables
+WORKER_STDOUT_S3_BUCKET=tos-mindverse
+WORKER_STDOUT_S3_PREFIX=inspect-out/
+WORKER_NETWORK_MODE=host                # default "none" can't reach TOS
+```
+
+api-rust forwards a whitelisted set of envs to every worker container it spawns
+(`WORKER_STDOUT_S3_*`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`). It also
+maps the friendlier `TOS_*` names onto their AWS / WORKER equivalents so you
+only declare credentials once.
+
+### Sandbox snapshot to TOS
+
+`POST /sandboxes/:id/snapshot` (on the e2b-shim port :8001) tarballs the
+sandbox's host fs dir, gzips it, uploads to
+`s3://$TOS_BUCKET/sandboxes/<sid>/<timestamp>.tar.gz`, and returns
+`{tos_url, key, size_bytes, bucket, endpoint, region}`. Returns 503 if TOS
+isn't configured. Useful for SWE-bench-style archival when a sandbox is about
+to be reaped.
+
+### Backup a docker image tarball to TOS
+
+```bash
+./scripts/backup-image-to-tos.sh inspect-tpl-default:latest
+# → tos://$TOS_BUCKET/harbor/containers/inspect-tpl-default__latest.tar
+```
+
+Streams `docker save` through the `aws` CLI into TOS via S3-compatible endpoint.
+Requires `aws` v2 installed on the host.
+
 ## Repo layout
 
 ```
@@ -421,6 +486,10 @@ message ExecResult {
 ├── templates/<name>/                Per-template config (template.toml + optional Dockerfile)
 ├── start.sh stop.sh status.sh run.sh
 ├── patch-e2b-sdk.sh                 One-shot: drop debug-mode kill/timeout no-ops
+├── scripts/
+│   └── backup-image-to-tos.sh       docker save | aws s3 cp (Volcano TOS / S3)
+├── .env.example                     Registry + TOS config template (copy to .env)
+├── docker-compose.yml
 ├── grafana-dashboard.json
 ├── bench-baseline.txt               Historical perf log + experiment results
 └── README.md

@@ -25,6 +25,9 @@ bollard = "0.17"
 futures = "0.3"
 tokio-stream = "0.1"
 tower-http = { version = "0.5", features = ["cors"] }
+rust-s3 = { version = "0.36", default-features = false, features = ["tokio-rustls-tls"] }
+flate2 = "1"
+tar = "0.4"
 
 [build-dependencies]
 prost-build = "0.13"

@@ -29,6 +29,16 @@ struct Args {
     /// Override ROOT (default: /opt/inspect-api)
     #[arg(long)]
     root: Option<PathBuf>,
+
+    /// After build, also `docker tag` + `docker push` to the registry.
+    /// REGISTRY_HOST and REGISTRY_NAMESPACE must be set (in .env or shell env).
+    /// You must `docker login` to REGISTRY_HOST beforehand.
+    #[arg(long)]
+    push: bool,
+
+    /// Tag to use when pushing (default: "latest").
+    #[arg(long, default_value = "latest")]
+    push_tag: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +141,32 @@ fn build(root: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn push_to_registry(name: &str, push_tag: &str) -> Result<()> {
+    let host = std::env::var("REGISTRY_HOST")
+        .map_err(|_| anyhow!("--push requires REGISTRY_HOST env var"))?;
+    let ns = std::env::var("REGISTRY_NAMESPACE")
+        .map_err(|_| anyhow!("--push requires REGISTRY_NAMESPACE env var"))?;
+    let local_tag = format!("inspect-tpl-{}:latest", name);
+    let remote_tag = format!("{}/{}/inspect-tpl-{}:{}", host, ns, name, push_tag);
+
+    println!("[push] tagging {} → {}", local_tag, remote_tag);
+    let st = Command::new("docker").args(["tag", &local_tag, &remote_tag]).status()
+        .context("spawn docker tag")?;
+    if !st.success() { return Err(anyhow!("docker tag failed")); }
+
+    println!("[push] pushing {}", remote_tag);
+    let st = Command::new("docker").args(["push", &remote_tag]).status()
+        .context("spawn docker push")?;
+    if !st.success() {
+        return Err(anyhow!(
+            "docker push failed; did you `docker login {}` ? (REGISTRY_USER / REGISTRY_PASSWORD)",
+            host
+        ));
+    }
+    println!("=== pushed {} ===", remote_tag);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let root = args.root.unwrap_or_else(|| PathBuf::from(ROOT));
@@ -139,6 +175,9 @@ fn main() -> Result<()> {
     }
     for name in &args.names {
         build(&root, name)?;
+        if args.push {
+            push_to_registry(name, &args.push_tag)?;
+        }
     }
     Ok(())
 }

@@ -1,10 +1,7 @@
 # Brings up `mindbox` (api-rust + e2b-shim in one container).
 #
+#   cp .env.example .env  # optional, for registry / TOS integration
 #   docker compose up -d --build
-#
-# The /jobs durable queue is an opt-in advanced feature backed by an external
-# NATS JetStream. See README "Optional: durable async job queue" for how to
-# wire it up when you actually need it. Most workloads just use /exec_hot.
 
 services:
   mindbox:
@@ -12,6 +9,9 @@ services:
       context: .
       dockerfile: Dockerfile
     image: mindbox:latest
+    env_file:
+      - path: .env
+        required: false
     environment:
       MINDBOX_MODE: both
       INSPECT_API_TEMPLATES_DIR: /opt/inspect-api/templates

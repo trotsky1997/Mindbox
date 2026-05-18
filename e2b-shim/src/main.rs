@@ -152,6 +152,26 @@ struct AppState {
     upstream: String,
     http: reqwest::Client,
     api_key: Option<String>,
+    tos: Option<Arc<TosConfig>>,
+}
+
+struct TosConfig {
+    bucket: Box<s3::Bucket>,
+    bucket_name: String,
+    region: String,
+    endpoint: String,
+}
+
+fn tos_from_env() -> Option<TosConfig> {
+    let bucket_name = std::env::var("TOS_BUCKET").ok().filter(|s| !s.is_empty())?;
+    let endpoint = std::env::var("TOS_S3_ENDPOINT").ok().filter(|s| !s.is_empty())?;
+    let region = std::env::var("TOS_REGION").unwrap_or_else(|_| "cn-beijing".into());
+    let ak = std::env::var("TOS_ACCESS_KEY").ok().filter(|s| !s.is_empty())?;
+    let sk = std::env::var("TOS_SECRET_KEY").ok().filter(|s| !s.is_empty())?;
+    let creds = s3::creds::Credentials::new(Some(&ak), Some(&sk), None, None, None).ok()?;
+    let r = s3::Region::Custom { region: region.clone(), endpoint: endpoint.clone() };
+    let bucket = s3::Bucket::new(&bucket_name, r, creds).ok()?.with_path_style();
+    Some(TosConfig { bucket, bucket_name, region, endpoint })
 }
 
 // ---- REST: POST /sandboxes ---------------------------------------------
@@ -1009,6 +1029,68 @@ fn sweep_expired(state: &Arc<AppState>) {
     }
 }
 
+
+// ---- sandbox snapshot → TOS ----------------------------------------------
+
+async fn sandbox_snapshot(
+    State(state): State<Arc<AppState>>,
+    Path(sid): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let tos = state.tos.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        r#"{"code":"unavailable","message":"TOS not configured"}"#.into(),
+    ))?;
+    // Make sure the sandbox exists (allow snapshot for both alive + already-dead).
+    let root = sandbox_fs_dir(&sid);
+    if !root.exists() {
+        return Err((StatusCode::NOT_FOUND, format!(r#"{{"code":"not_found","message":"sandbox {} fs dir not found"}}"#, sid)));
+    }
+
+    // tar.gz the dir in a blocking task (sync I/O).
+    let root_c = root.clone();
+    let sid_c = sid.clone();
+    let (key, body): (String, Vec<u8>) = tokio::task::spawn_blocking(move || -> std::io::Result<(String, Vec<u8>)> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        {
+            let enc = GzEncoder::new(&mut buf, Compression::fast());
+            let mut tar = tar::Builder::new(enc);
+            tar.append_dir_all(".", &root_c)?;
+            let enc = tar.into_inner()?;
+            enc.finish()?;
+        }
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let key = format!("sandboxes/{}/{}.tar.gz", sid_c, ts);
+        Ok((key, buf))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(r#"{{"code":"internal","message":"join: {}"}}"#, e)))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(r#"{{"code":"internal","message":"tar: {}"}}"#, e)))?;
+
+    let size = body.len() as u64;
+    let resp = tos.bucket.put_object(&key, &body).await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!(r#"{{"code":"bad_gateway","message":"tos put: {}"}}"#, e)))?;
+    let status = resp.status_code();
+    if !(200..300).contains(&status) {
+        return Err((StatusCode::BAD_GATEWAY, format!(r#"{{"code":"bad_gateway","message":"tos status {}"}}"#, status)));
+    }
+
+    let tos_url = format!("s3://{}/{}", tos.bucket_name, key);
+    Ok(Json(serde_json::json!({
+        "sandbox_id": sid,
+        "tos_url": tos_url,
+        "bucket": tos.bucket_name,
+        "key": key,
+        "size_bytes": size,
+        "endpoint": tos.endpoint,
+        "region": tos.region,
+    })))
+}
+
+
 // ---- main ---------------------------------------------------------------
 
 #[tokio::main]
@@ -1021,11 +1103,22 @@ async fn main() -> Result<()> {
         upstream, port, if api_key.is_some() { "set" } else { "open" });
 
     let prior = load_registry();
+    let tos = match tos_from_env() {
+        Some(t) => {
+            eprintln!("[e2b-shim] TOS configured: bucket={} endpoint={}", t.bucket_name, t.endpoint);
+            Some(Arc::new(t))
+        }
+        None => {
+            eprintln!("[e2b-shim] TOS not configured; /sandboxes/:id/snapshot disabled");
+            None
+        }
+    };
     let state = Arc::new(AppState {
         sandboxes: DashMap::new(),
         upstream,
         http: reqwest::Client::builder().http1_only().pool_max_idle_per_host(64).build()?,
         api_key,
+        tos,
     });
     for rec in prior {
         let sid = rec.sandbox_id.clone();
@@ -1038,6 +1131,7 @@ async fn main() -> Result<()> {
         .route("/sandboxes", post(create_sandbox))
         .route("/sandboxes/:id", get(get_sandbox).delete(delete_sandbox))
         .route("/sandboxes/:id/timeout", post(set_sandbox_timeout))
+        .route("/sandboxes/:id/snapshot", post(sandbox_snapshot))
         // Connect RPC paths (E2B SDK sends to {base_url}/process.Process/Start)
         .route("/process.Process/Start", post(process_start))
         .route("/process.Process/List", post(process_list))

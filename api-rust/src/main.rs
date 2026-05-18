@@ -494,9 +494,51 @@ async fn start_template_container(docker: &Docker, cfg: &TemplateConfig, idx: us
 
     let bind_spec = format!("{}:/sockets", host_dir.display());
 
+    // Forward selected env vars from the api-rust process to each worker
+    // container. Whitelist only — never blanket-pass the env (would leak
+    // unrelated secrets). These enable TOS / S3-compatible stdout offload
+    // via boto3 inside the worker.
+    let mut env: Vec<String> = Vec::new();
+    for k in [
+        "WORKER_STDOUT_S3_THRESHOLD",
+        "WORKER_STDOUT_S3_BUCKET",
+        "WORKER_STDOUT_S3_PREFIX",
+        "WORKER_STDOUT_S3_ENDPOINT_URL",
+        "WORKER_STDOUT_S3_REGION",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+    ] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.is_empty() { env.push(format!("{}={}", k, v)); }
+        }
+    }
+    // TOS_* are the human-facing names in .env; map them to the AWS / WORKER names.
+    if let (Ok(ak), Ok(sk)) = (std::env::var("TOS_ACCESS_KEY"), std::env::var("TOS_SECRET_KEY")) {
+        if !env.iter().any(|s| s.starts_with("AWS_ACCESS_KEY_ID=")) {
+            env.push(format!("AWS_ACCESS_KEY_ID={}", ak));
+        }
+        if !env.iter().any(|s| s.starts_with("AWS_SECRET_ACCESS_KEY=")) {
+            env.push(format!("AWS_SECRET_ACCESS_KEY={}", sk));
+        }
+    }
+    if let Ok(ep) = std::env::var("TOS_S3_ENDPOINT") {
+        if !ep.is_empty() && !env.iter().any(|s| s.starts_with("WORKER_STDOUT_S3_ENDPOINT_URL=")) {
+            env.push(format!("WORKER_STDOUT_S3_ENDPOINT_URL={}", ep));
+        }
+    }
+    if let Ok(r) = std::env::var("TOS_REGION") {
+        if !r.is_empty() && !env.iter().any(|s| s.starts_with("WORKER_STDOUT_S3_REGION=")) {
+            env.push(format!("WORKER_STDOUT_S3_REGION={}", r));
+        }
+    }
+    let env_opt = if env.is_empty() { None } else { Some(env) };
+
+    let net_mode = std::env::var("WORKER_NETWORK_MODE").unwrap_or_else(|_| "none".into());
+
     let config = bollard::container::Config::<String> {
         image: Some(tag),
         labels: Some(labels),
+        env: env_opt,
         host_config: Some(HostConfig {
             binds: Some(vec![bind_spec]),
             memory_reservation: Some(mem),
@@ -504,7 +546,7 @@ async fn start_template_container(docker: &Docker, cfg: &TemplateConfig, idx: us
             pids_limit: Some(cfg.pids_limit),
             oom_score_adj: Some(500),
             security_opt: Some(vec!["no-new-privileges".into()]),
-            network_mode: Some("none".into()),
+            network_mode: Some(net_mode),
             ..Default::default()
         }),
         ..Default::default()
