@@ -259,30 +259,3 @@ Transfer/sec:      2.56MB
 ##               exec_direct() bypasses worker parent on hot path
 ##               child_fd_pools<PathBuf, VecDeque<UnixStream>> per container
 ##   - nix deps: 0.29 with feature "uio"
-
-##
-## 2026-05-19: NATS JetStream queue
-## --------------------------------
-## NATS image: nats:latest, JetStream enabled, single-node, on same host as api-rust.
-##
-## Throughput:
-##   /exec_hot (sync, queue connected but unused):  18,949 RPS
-##   /jobs (enqueue: NATS publish-ack + KV put):    10,994 RPS
-##                                                  (~58% of sync; cost = durability)
-##   consumer drain rate sustained ≥11K/sec
-##                                                  (backlog stayed at 0 during the
-##                                                  10s burst at 10.9K enqueue RPS)
-##
-## End-to-end (POST /jobs + poll GET /jobs/<id> until done):
-##                                  p50    p95   p99    max
-##   concurrency  1 (500 jobs):    1.6ms  1.8   1.9    4.5
-##   concurrency  8 (500 jobs):   12.6   17.1  19.7   20.8
-##   concurrency 32 (500 jobs):   51.4   74.1  86.8   96.6
-##   concurrency 64 (500 jobs):   80.5  144.2 176.8  204.6
-##                                  e2e RPS: ~550-600 across conc levels
-##                                  (poll loop is 5ms-sleep; cuts max throughput)
-##
-## Takeaway: /jobs is for durable async batches. For fast sync, use /exec_hot.
-## The poll-based GET is fine for batch jobs but bad for sub-second latency.
-## Consumer behaviour: pull-based, durable=mindbox-worker, max_deliver=5,
-## ack_wait=300s. Multiple api-rust instances form a competing-consumer group.

@@ -55,48 +55,19 @@ docker compose up -d --build
 # Build a template image (once per template name)
 docker compose exec mindbox template-build default
 
-# Sync exec (low latency)
 curl -X POST http://localhost:8000/exec_hot \
   -H "Content-Type: application/json" \
   -d '{"template":"default","code":"print(2+2)"}'
 # → {"stdout":"4\n","exit_code":0,"elapsed_ms":1,...}
-
-# Async exec via the NATS-backed queue (durable across api restart)
-curl -X POST http://localhost:8000/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"template":"default","code":"print(2+2)"}'
-# → {"job_id":"j…","status":"pending"}
-curl http://localhost:8000/jobs/j…
-# → {"job_id":"…","status":"done","result":{"stdout":"4\n",…}, ...}
 ```
 
-`docker-compose.yml` brings up `nats` + `mindbox` (combined api-rust + e2b-shim
-in one container). NATS lives behind volume `nats-data`, shim sandbox registry
-behind `shim-state`; both survive `docker compose down` unless you pass `-v`.
+`docker-compose.yml` brings up the combined `mindbox` container (api-rust on
+`:8000`, e2b-shim on `:8001`). Shim sandbox registry lives in volume
+`shim-state`; survives `docker compose down` unless you pass `-v`.
 
 For separate api-only or shim-only deployment, use the per-service Dockerfiles:
 `api-rust/Dockerfile` and `e2b-shim/Dockerfile`. The combined image accepts
 `MINDBOX_MODE=api|shim|both` (default `both`).
-
-### Manual docker run (without compose)
-
-```bash
-docker build -t mindbox .
-docker run -d --name nats -p 4222:4222 nats:latest -js
-docker run -d --name mindbox \
-  --link nats \
-  -p 8000:8000 -p 8001:8001 \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /opt/inspect-api/sockets:/opt/inspect-api/sockets \
-  -v $PWD/templates:/opt/inspect-api/templates:ro \
-  -v mindbox-shim-state:/var/lib/e2b-shim \
-  -e INSPECT_API_TEMPLATES_DIR=/opt/inspect-api/templates \
-  -e MINDBOX_NATS_URL=nats://nats:4222 \
-  mindbox
-```
-
-Without `MINDBOX_NATS_URL`, the `/jobs` endpoints return 503; `/exec_hot` and
-the E2B shim still work fine.
 
 ## Endpoints (api-rust on :8000)
 
@@ -109,9 +80,6 @@ the E2B shim still work fine.
 | POST   | /admin/drain   | `{"template":"...","pid":N,"reason":"..."}`    | fans out drain to template's containers |
 | POST   | /exec_hot      | `{"template":"...","code":"...","timeout":N,"env":{},"files":{}}` | stdout/stderr/exit_code/elapsed_ms |
 | POST   | /exec          | (cold path, currently 503) | — |
-| POST   | /jobs          | same body as `/exec_hot` | `{job_id, status:"pending"}`; only when `MINDBOX_NATS_URL` is set |
-| GET    | /jobs/:id      | — | `JobState{status, result?, error?, started_at, completed_at, ...}` |
-| DELETE | /jobs/:id      | — | best-effort cancel (consumer skips if cancelled at pull time) |
 
 Worker-rust speaks only unix-socket protobuf (no HTTP) — `proto/inspect.proto`.
 api-rust translates HTTP→protobuf and back; users never touch the worker directly.
@@ -160,7 +128,6 @@ cd worker-rust && cargo build --release
 | `PORT` | 8000 | HTTP port |
 | `INSPECT_API_TEMPLATES_DIR` | `/opt/inspect-api/templates` | template scan dir |
 | `INSPECT_API_MAX_TIMEOUT` | 60 | max user code timeout (seconds) |
-| `MINDBOX_NATS_URL` | (unset) | NATS endpoint (e.g. `nats://nats:4222`); when set, `/jobs` endpoints activate and a JetStream consumer is spawned |
 
 ### worker-rust (baked into image via Dockerfile from template.toml)
 | Var | Default | Purpose |
@@ -291,21 +258,6 @@ Template: `data-science` (4 containers × pool 32), payload: `print(2+2)`.
 
 Negative result: tokio-uring migration on worker IO → +3% (within noise),
 rolled back. Epoll wasn't the bottleneck; fork rate is the new ceiling at ~20K.
-
-### Queue path (`/jobs`)
-
-| Path | Throughput | Latency notes |
-|---|---|---|
-| `POST /exec_hot` (sync) | 19K RPS | hot path, no queue |
-| `POST /jobs` (enqueue only) | 11K RPS | NATS publish-ack + KV put per request |
-| consumer drain | ≥11K/sec | matches sustained enqueue rate |
-| e2e (POST + poll) c=8 | 580 RPS, p50 12.6 / p99 19.7 ms | poll-loop has 5 ms sleep |
-| e2e (POST + poll) c=64 | 550 RPS, p50 80.5 / p99 176.8 ms | |
-
-`/jobs` is the durability path: roughly half the sync throughput, but survives
-api/shim restart and supports competing consumers across multiple api-rust
-instances. Use `/exec_hot` for sub-ms sync execution; use `/jobs` for batches
-where you don't need to block.
 
 ## Troubleshooting
 

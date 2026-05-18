@@ -1,48 +1,29 @@
-# Bring up the full stack: NATS JetStream + Mindbox (api-rust + e2b-shim).
+# Brings up `mindbox` (api-rust + e2b-shim in one container).
 #
-# Usage:
 #   docker compose up -d --build
-#   curl -X POST http://localhost:8000/jobs \
-#        -H "Content-Type: application/json" \
-#        -d '{"template":"default","code":"print(42)"}'
-#   docker compose exec mindbox template-build default   # build a template once
+#
+# The /jobs durable queue is an opt-in advanced feature backed by an external
+# NATS JetStream. See README "Optional: durable async job queue" for how to
+# wire it up when you actually need it. Most workloads just use /exec_hot.
 
 services:
-  nats:
-    image: nats:latest
-    command: ["-js", "-m", "8222", "-sd", "/data"]
-    ports:
-      - "4222:4222"   # client protocol
-      - "8222:8222"   # monitoring
-    volumes:
-      - nats-data:/data
-    restart: unless-stopped
-
   mindbox:
     build:
       context: .
       dockerfile: Dockerfile
     image: mindbox:latest
-    depends_on:
-      - nats
     environment:
       MINDBOX_MODE: both
-      MINDBOX_NATS_URL: nats://nats:4222
       INSPECT_API_TEMPLATES_DIR: /opt/inspect-api/templates
       RUST_LOG: info
     ports:
-      - "8000:8000"   # api-rust HTTP (incl. /jobs)
+      - "8000:8000"   # api-rust HTTP (incl. /exec_hot)
       - "8001:8001"   # e2b-shim (E2B-compatible)
     volumes:
-      # api-rust manages template containers on the host docker
       - /var/run/docker.sock:/var/run/docker.sock
-      # Worker containers bind-mount the same sockets/ path on the host
       - /opt/inspect-api/sockets:/opt/inspect-api/sockets
-      # Template definitions (template.toml etc.); read-only is fine
       - ./templates:/opt/inspect-api/templates:ro
-      # Shim sandbox registry survives container restart
       - shim-state:/var/lib/e2b-shim
 
 volumes:
-  nats-data:
   shim-state:
