@@ -170,7 +170,9 @@ fn tos_from_env() -> Option<TosConfig> {
     let sk = std::env::var("TOS_SECRET_KEY").ok().filter(|s| !s.is_empty())?;
     let creds = s3::creds::Credentials::new(Some(&ak), Some(&sk), None, None, None).ok()?;
     let r = s3::Region::Custom { region: region.clone(), endpoint: endpoint.clone() };
-    let bucket = s3::Bucket::new(&bucket_name, r, creds).ok()?.with_path_style();
+    // Volcano TOS rejects path-style; must use virtual-hosted addressing
+    // (bucket name in hostname). rust-s3 defaults to virtual-hosted.
+    let bucket = s3::Bucket::new(&bucket_name, r, creds).ok()?;
     Some(TosConfig { bucket, bucket_name, region, endpoint })
 }
 
@@ -1063,7 +1065,7 @@ async fn sandbox_snapshot(
             enc.finish()?;
         }
         let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let key = format!("sandboxes/{}/{}.tar.gz", sid_c, ts);
+        let key = format!("harbor/sandboxes/{}/{}.tar.gz", sid_c, ts);
         Ok((key, buf))
     })
     .await
