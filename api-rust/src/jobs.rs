@@ -79,8 +79,22 @@ pub struct JobResult {
 }
 
 pub async fn connect(url: &str) -> Result<Jobs> {
-    let client = async_nats::connect(url).await
-        .map_err(|e| anyhow!("nats connect {}: {}", url, e))?;
+    // Retry on NATS startup race (compose ordering, container restart, etc.).
+    let mut last_err: Option<async_nats::ConnectError> = None;
+    let mut client_opt = None;
+    for i in 0..30 {
+        match async_nats::connect(url).await {
+            Ok(c) => { client_opt = Some(c); break; }
+            Err(e) => {
+                last_err = Some(e);
+                let backoff = Duration::from_millis(200 * (i + 1).min(10));
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+    let client = client_opt
+        .ok_or_else(|| anyhow!("nats connect {} after retries: {}", url,
+                               last_err.map(|e| e.to_string()).unwrap_or_default()))?;
     let js = jetstream::new(client);
     let s = js.get_or_create_stream(stream::Config {
         name: STREAM_NAME.into(),
