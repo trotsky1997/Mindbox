@@ -1,0 +1,124 @@
+{
+  "title": "Inspect API",
+  "uid": "inspect-api",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "templating": {
+    "list": [
+      {
+        "name": "template",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "PROMETHEUS" },
+        "query": "label_values(inspect_requests_total, template)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1, "title": "RPS", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "PROMETHEUS" },
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(rate(inspect_requests_total{template=~\"$template\"}[1m])) by (template)",
+          "legendFormat": "{{template}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "options": { "legend": { "displayMode": "table", "placement": "right" } }
+    },
+    {
+      "id": 2, "title": "Pool occupancy (idle / active)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "PROMETHEUS" },
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "inspect_idle{template=~\"$template\"}", "legendFormat": "idle / {{template}}", "refId": "A" },
+        { "expr": "inspect_active{template=~\"$template\"}", "legendFormat": "active / {{template}}", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" } } } }
+    },
+    {
+      "id": 3, "title": "Fork rate (replenishments / sec)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "PROMETHEUS" },
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(rate(inspect_forks_total{template=~\"$template\"}[1m])) by (template)",
+          "legendFormat": "{{template}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "id": 4, "title": "Respawns by reason", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "PROMETHEUS" },
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(rate(inspect_respawns_total{template=~\"$template\"}[5m])) by (reason)",
+          "legendFormat": "{{reason}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "stacking": { "mode": "normal" }, "fillOpacity": 30 } } }
+    },
+    {
+      "id": 5, "title": "Hard kills by reason", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "PROMETHEUS" },
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(rate(inspect_kills_total{template=~\"$template\"}[5m])) by (reason)",
+          "legendFormat": "{{reason}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "stacking": { "mode": "normal" }, "fillOpacity": 30 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "hard_timeout" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
+        ]
+      }
+    },
+    {
+      "id": 6, "title": "Reuse efficiency (reqs / fork)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "PROMETHEUS" },
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(rate(inspect_requests_total{template=~\"$template\"}[5m])) by (template) / clamp_min(sum(rate(inspect_forks_total{template=~\"$template\"}[5m])) by (template), 0.001)",
+          "legendFormat": "{{template}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1 } },
+      "options": { "legend": { "displayMode": "table", "placement": "right" } }
+    },
+    {
+      "id": 7, "title": "Total requests served", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "PROMETHEUS" },
+      "gridPos": { "x": 0, "y": 24, "w": 6, "h": 4 },
+      "targets": [ { "expr": "sum(inspect_requests_total{template=~\"$template\"})", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } } }
+    },
+    {
+      "id": 8, "title": "Total forks", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "PROMETHEUS" },
+      "gridPos": { "x": 6, "y": 24, "w": 6, "h": 4 },
+      "targets": [ { "expr": "sum(inspect_forks_total{template=~\"$template\"})", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "purple" } } }
+    },
+    {
+      "id": 9, "title": "Idle now", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "PROMETHEUS" },
+      "gridPos": { "x": 12, "y": 24, "w": 6, "h": 4 },
+      "targets": [ { "expr": "sum(inspect_idle{template=~\"$template\"})", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "green" } } }
+    },
+    {
+      "id": 10, "title": "Hard timeouts (lifetime)", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "PROMETHEUS" },
+      "gridPos": { "x": 18, "y": 24, "w": 6, "h": 4 },
+      "targets": [ { "expr": "sum(inspect_kills_total{template=~\"$template\",reason=\"hard_timeout\"})", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" },
+        "thresholds": { "steps": [
+          { "value": null, "color": "green" }, { "value": 1, "color": "yellow" }, { "value": 100, "color": "red" }
+        ] } } }
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+# Build artifacts
+target/
+**/*.lock.bak
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime state
+sockets/
+runs/
+shim.pid
+*.log
+proto/py_betterproto/
+
+# Local overrides
+.env
+.env.local

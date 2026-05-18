@@ -1,0 +1,261 @@
+# Hot path baseline (2026-05-18T10:48Z)
+Hardware: 48 CPU (Xeon 8582C 24c/48t), 25.38 GiB RAM
+Architecture: 1 uvicorn worker, data-science = 2 containers x 32 pool = 64 slots
+Code: import numpy; r = numpy.zeros(10).sum(); print(r)
+
+## warm single-shot: ~4ms
+
+## wrk -t8 -c64 -d30s:
+Running 30s test @ http://127.0.0.1:8000/exec_hot
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   363.66ms  656.21ms   7.17s    90.15%
+    Req/Sec    85.73     32.49   200.00     65.24%
+  20406 requests in 30.02s, 4.19MB read
+Requests/sec:    679.63
+Transfer/sec:    142.75KB
+
+# Stage 2: Rust worker integration (2026-05-18T11:37Z)
+## Architecture: Python uvicorn API + 2x Rust worker containers (data-science) + 1x default
+## Code: import numpy; r = numpy.zeros(10).sum(); print(r)
+
+### Direct (single Rust worker, host run, bypassing API)
+32 conn: 1019 RPS, 38ms latency  <-- vs Python worker 380 RPS = 2.7x
+64 conn: 900 RPS, 85ms latency (saturated)
+CPU: 251%, RSS 21MB
+
+### End-to-end through Python API
+Running 20s test @ http://127.0.0.1:8000/exec_hot
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   113.84ms   77.87ms 908.49ms   76.30%
+    Req/Sec    75.48     20.94   181.00     69.69%
+  12052 requests in 20.02s, 2.47MB read
+Requests/sec:    602.00
+Transfer/sec:    126.59KB
+
+### Bottleneck
+uvicorn (Python) 100% CPU, ~600-700 RPS ceiling.
+Workers using 4 cores combined (out of 48), have 4-5x more headroom.
+Next step: Rust-ize the API to break the Python CPU ceiling.
+
+# Stage 3: worker-rust reuse (2026-05-18T12:27Z)
+Architecture: Rust API + 4x Rust worker containers (data-science, no prewarm)
+Each child reuses for up to WORKER_REUSE_MAX_REQS=200 requests
+Code: print(1)
+
+Running 30s test @ http://127.0.0.1:8000/exec_hot
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    25.37ms   29.50ms 104.70ms   79.48%
+    Req/Sec   716.22     74.19     0.92k    69.29%
+  171146 requests in 30.01s, 31.84MB read
+Requests/sec:   5703.46
+Transfer/sec:      1.06MB
+
+# Stage 5: full lifecycle (2026-05-18T12:57Z)
+## Added: active gc.collect(), reaper thread (age/idle eviction), /stats endpoint,
+## per-child metadata (born_at/last_used/reqs_served/rss_mb), respawn reason tracking
+
+### Bench
+Running 30s test @ http://127.0.0.1:8000/exec_hot
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    25.68ms   29.58ms 107.09ms   78.41%
+    Req/Sec   654.90     84.27     1.63k    74.75%
+  156682 requests in 30.08s, 29.15MB read
+Requests/sec:   5209.04
+Transfer/sec:      0.97MB
+
+### Verified: requests_total=167583 forks_total=890 (64 initial + 826 max_reqs respawns)
+### Reuse ratio: 167583/890 = ~188 reqs per fork
+
+# Stage 7: unix socket transport (2026-05-18T13:44Z)
+## Drop HTTP+TCP between api-rust and worker containers.
+## api connects via /opt/inspect-api/sockets/<tpl>-<idx>-<ns>/worker.sock
+## worker --network none + bind mount
+
+Running 30s test @ http://127.0.0.1:8000/exec_hot
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    24.70ms   29.21ms 189.07ms   77.36%
+    Req/Sec   789.09     80.54     1.46k    73.42%
+  188567 requests in 30.01s, 35.08MB read
+Requests/sec:   6283.03
+Transfer/sec:      1.17MB
+
+### Math: 571280 reqs / 2880 forks = ~198 reqs/fork; forks=64 init + 2816 max_reqs
+### API CPU dropped to 43% (vs 73% with HTTP), workers 130-142% (vs 100% with HTTP)
+
+# Stage 8: end-to-end protobuf (2026-05-18T14:01Z)
+## Wire format: prost (Rust) + google.protobuf (Python) instead of JSON
+## protoc 34.1 from GitHub release; Python protobuf>=5.x
+## api ↔ worker ↔ child all use protobuf Job/ChildResponse
+
+Running 30s test @ http://127.0.0.1:8000/exec_hot
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    24.56ms   29.15ms 193.93ms   77.67%
+    Req/Sec   825.62    108.46     1.90k    81.43%
+  197608 requests in 30.10s, 36.76MB read
+Requests/sec:   6565.07
+Transfer/sec:      1.22MB
+
+### Gain vs JSON (Stage 7): +5-7% on tiny print(1) payload; bigger on larger payloads.
+
+# Stage 9: fast-path in sandbox_helper.py (2026-05-18T14:15Z)
+## Skip tempfile.mkdtemp/chdir/env-save when job.files and job.env are both empty
+## (the common case for trivial code like print(1))
+## Tried betterproto v2 (regressed to 6033 RPS due to FFI overhead on tiny msgs)
+## Reverted to Google protobuf; kept fast-path; doubled throughput.
+
+Running 30s test @ http://127.0.0.1:8000/exec_hot
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    21.27ms   27.20ms 100.51ms   78.91%
+    Req/Sec     1.61k   181.43     4.02k    77.96%
+  384983 requests in 30.07s, 71.61MB read
+Requests/sec:  12800.94
+Transfer/sec:      2.38MB
+
+# Stage 10: compile cache + S3 offload + 8 containers (2026-05-18T14:36Z)
+## compile cache: lru_cache(1024) on compile(); hits at ~0us, misses at ~5-50us
+## S3 offload: graceful no-op when WORKER_STDOUT_S3_BUCKET unset; tested 50KB passthrough
+## Container count: 4→8 = +9% (14418); 8→16 = no further gain (13513), reverted to 8
+## Sweet spot: 8 containers × 16 pool = 128 slots
+
+Running 30s test @ http://127.0.0.1:8000/exec_hot
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    21.59ms   27.70ms  97.92ms   79.19%
+    Req/Sec     1.72k   252.86     3.91k    78.42%
+  411880 requests in 30.07s, 76.61MB read
+Requests/sec:  13699.25
+Transfer/sec:      2.55MB
+
+# Stage 11: PagedRegistry (2026-05-18T14:49Z)
+## Lazy template start + LRU eviction; INSPECT_API_HOT_LIMIT=16 default
+## Tested with 22 templates (20 test- aliased to default image + data-science + default)
+## Cold start latency: ~210ms (docker create + start + wait_ready)
+## Hot fast path: 1-2ms
+## Single hot template bench: 14123 RPS (no regression)
+## 10-template random rotation, HOT_LIMIT=8: 13595 RPS
+
+### Architecture for SWE-bench (500+ templates):
+###   - Pre-build all 500 docker images (template-build)
+###   - Configure HOT_LIMIT to match memory budget (e.g. 16-32 templates)
+###   - Lazy-start on first hit; LRU-evict when full
+
+# Stage 12: Warm tier (docker pause/unpause) (2026-05-18T14:56Z)
+## Tiers: Hot (running) / Warm (paused) / Cold (no container)
+## Cascade: Hot full → demote LRU Hot → Warm; Warm full → drop oldest Warm → Cold
+## Transition latencies:
+##   Cold → Hot:  ~210ms (docker create+start+wait_ready)
+##   Warm → Hot:  ~40ms  (docker unpause; 5× faster than cold)
+##   Hot fast:    ~1-2ms
+## env: INSPECT_API_HOT_LIMIT, INSPECT_API_WARM_LIMIT
+## NOTE: Warm containers still consume MEMORY (only CPU frozen). For mem savings, evict to Cold.
+
+# Stage 13: DashMap + SO_REUSEPORT (2026-05-18T15:04Z)
+## DashMap shards unix_pools by socket_path. API CPU 74% → 12%.
+## SO_REUSEPORT + INSPECT_API_REPLICAS=N supported (not net-positive at current load).
+## start.sh: INSPECT_API_REPLICAS=2 spawns multi-pane tmux session.
+
+Running 30s test @ http://127.0.0.1:8000/exec_hot
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    21.59ms   27.70ms  90.85ms   79.18%
+    Req/Sec     1.73k   266.90     3.09k    78.10%
+  414375 requests in 30.10s, 77.07MB read
+Requests/sec:  13766.96
+Transfer/sec:      2.56MB
+
+# Stage 14 (final): sweep + LTO fat (2026-05-18T15:20Z)
+## Container × pool sweep (all 128 slots, wrk c=64):
+##   1c × 128p: 13,576 RPS   API 53%   workers 494% (1 ctr uses 5 cores)
+##   2c × 64p:  14,047 RPS   API 73%   workers 515%
+##   4c × 32p:  14,519 RPS   API 73%   workers ~500% ← SWEET SPOT
+##   8c × 16p:  14,261 RPS   API 63%   workers ~485%
+##   16c × 8p:  13,969 RPS   API 127%  workers ~485% (API CPU explodes)
+## More slots/conns dont help; total worker CPU caps at ~500% (5 cores).
+## LTO fat: no measurable gain over thin (14106 vs 14519 = same).
+##
+## Conclusion: 14.5K RPS is the system ceiling on this architecture.
+## Next 2× requires:
+##   - tokio-uring (epoll → io_uring): ~1.5-2× expected
+##   - Shared-memory ring buffer between API and worker: ~3-5×
+##   - Bypass parent dispatcher (API → child fd direct via SCM_RIGHTS): ~5-10×
+
+Running 30s test @ http://127.0.0.1:8000/exec_hot
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    21.24ms   27.31ms  92.73ms   79.15%
+    Req/Sec     1.73k   264.20     2.97k    76.27%
+  413714 requests in 30.10s, 76.95MB read
+Requests/sec:  13744.78
+Transfer/sec:      2.56MB
+
+##
+## 2026-05-19: tokio-uring experiment (worker-rust)
+## ------------------------------------------------
+## Hypothesis: epoll syscall overhead is bottleneck → io_uring gives 1.5-2×.
+##
+## Migration: worker-rust UnixListener/UnixStream → tokio_uring::net::*.
+## Single-thread tokio_uring per container (tokio_uring::net::UnixListener has
+## no from_std/from_raw_fd, can't share fd across runtime threads).
+## Required ulimit memlock=-1 on each worker container.
+##
+## Result:
+##   baseline (tokio multi-thread):  15,006 RPS
+##   tokio-uring (single thread):    15,508 RPS  (+3.3%, within noise)
+##
+## Conclusion: epoll cost is NOT the bottleneck. Real cost is fork() + Python
+## interpreter setup in the children. The cycles never reach the IO layer
+## because each request waits ~100us on the child fork/handoff.
+##
+## Decision: rolled back. Kept tokio multi-thread runtime. Ditched tokio-uring
+## dep, dropped the memlock ulimit from container config.
+##
+## Next 2× would need to actually attack the fork path:
+##   - Raise MAX_REQS to drive more child reuse (limited by Python state pollution)
+##   - posix_spawn instead of fork() — needs new pre-warmed exec image
+##   - Pre-allocated child pool with FD passing instead of fork-on-demand
+
+##
+## 2026-05-19: FD-passing direct path (api-rust → child socketpair)
+## ----------------------------------------------------------------
+## Architecture change:
+##   before: api-rust → worker parent (dispatch) → child (exec)
+##           api-rust does 1 RPC to parent per request; parent reads child's
+##           response and forwards back. Parent CPU on hot path.
+##   after:  api-rust → child (exec, direct)
+##           api-rust leases parent-end socketpair fds via SCM_RIGHTS at startup
+##           (cmd="lease" returns N fds in one recvmsg). For each request,
+##           pops fd from local pool, writes Job, reads ChildResponse. If
+##           ChildResponse.expire, closes fd → child exits → parent's reaper
+##           refills the idle pool, api-rust transparently leases more.
+##   parent role: now only forks/supervises children + serves health/stats/
+##                drain. Out of the hot path entirely.
+##
+## Wire protocol:
+##   - cmd="lease", lease_count=N → response carries N fds via SCM_RIGHTS cmsg
+##   - cmd="refill"               → response carries 1 fd via SCM_RIGHTS cmsg
+##   - cmsg-bearing reply must be a single recvmsg; can't be split across
+##     read() calls (cmsg is delivered with the FIRST byte of the message).
+##
+## Result on data-science (4 containers × pool_size 32):
+##   baseline (parent dispatcher):  15,006 RPS
+##   fd-passing direct:             20,588 RPS  (+37%)
+##   plateau across c=64/128/256 → new ceiling is fork rate, not IPC.
+##
+## Regression: concurrent stress (40 ops × 2 sandboxes), binary file
+## roundtrip, full E2B SDK coverage probe all pass.
+##
+## Code:
+##   - proto/inspect.proto: Request.lease_count = 4
+##   - worker-rust: send_with_fds() via nix::sys::socket::sendmsg + SCM_RIGHTS
+##                  cmd="lease"/"refill" handlers; old exec path kept for compat
+##   - api-rust: lease_child_fds_blocking() via recvmsg + ControlMessageOwned
+##               exec_direct() bypasses worker parent on hot path
+##               child_fd_pools<PathBuf, VecDeque<UnixStream>> per container
+##   - nix deps: 0.29 with feature "uio"

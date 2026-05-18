@@ -1,0 +1,81 @@
+syntax = "proto3";
+package inspect;
+
+// ============================================================================
+// API ↔ worker container (over unix socket bind-mounted into container)
+// ============================================================================
+
+// One Request per RPC. `cmd` selects: "exec" (or empty), "health", "stats", "drain".
+message Request {
+  string cmd = 1;
+  Job job = 2;
+  DrainReq drain = 3;
+  uint32 lease_count = 4;  // for cmd="lease": how many child fds to hand out via SCM_RIGHTS
+}
+
+message Job {
+  string code = 1;
+  uint32 timeout = 2;
+  map<string, string> env = 3;
+  map<string, string> files = 4;
+  bool persist_changes = 5;        // worker scans run_dir and returns deltas
+  string persist_root_label = 6;   // optional name to identify root in logs
+}
+
+message DrainReq {
+  optional uint32 pid = 1;
+  string reason = 2;
+}
+
+// One Response per RPC. `kind` matches: "exec", "health", "stats", "drain", "error".
+message Response {
+  string kind = 1;
+  ExecResult exec = 2;
+  HealthResp health = 3;
+  // Stats / drain results are forwarded as JSON inside this string. Those
+  // endpoints are low-volume; not worth carrying the full schema across.
+  string json = 4;
+  string error = 5;
+}
+
+message ExecResult {
+  string stdout = 1;
+  string stderr = 2;
+  int32 exit_code = 3;
+  uint64 elapsed_ms = 4;
+  map<string, string> output_files = 5;
+  repeated string deleted_files = 6;
+  map<string, string> output_files_b64 = 7;  // base64-encoded binary files
+}
+
+message HealthResp {
+  bool ok = 1;
+  uint32 pid = 2;
+  uint32 pool_size = 3;
+  uint32 idle = 4;
+  repeated string prewarm = 5;
+}
+
+// ============================================================================
+// Worker parent ↔ child (over socketpair inside the container)
+// ============================================================================
+
+// Child receives a Job. Child sends back a ChildResponse with inline Lifecycle.
+message ChildResponse {
+  string stdout = 1;
+  string stderr = 2;
+  int32 exit_code = 3;
+  bool expire = 4;
+  Lifecycle lifecycle = 5;
+  map<string, string> output_files = 6;
+  repeated string deleted_files = 7;
+  map<string, string> output_files_b64 = 8;
+}
+
+message Lifecycle {
+  uint64 rss_mb = 1;
+  uint64 requests_served = 2;
+  uint64 age_sec = 3;
+  uint64 total_exec_ms = 4;
+  string expire_reason = 5;  // empty when not expiring
+}
