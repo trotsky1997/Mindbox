@@ -19,6 +19,9 @@ libc = "0.2"
 bollard = "0.17"
 prost = "0.13"
 dashmap = "6"
+async-nats = "0.42"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+futures-util = "0.3"
 
 [build-dependencies]
 prost-build = "0.13"

@@ -29,6 +29,9 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/inspect.rs"));
 }
 
+mod jobs;
+use axum::extract::Path as AxumPath;
+
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 const SOCKET_ROOT: &str = "/opt/inspect-api/sockets";
 
@@ -122,6 +125,7 @@ struct AppState {
     lease_locks: dashmap::DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>,
     pool_cap_per_path: usize,
     max_timeout: u32,
+    jobs: Option<Arc<jobs::Jobs>>,
 }
 
 // ---- Paged registry: lazy start + LRU eviction --------------------------
@@ -926,6 +930,180 @@ async fn exec_cold() -> impl IntoResponse {
         "/exec (cold path) not implemented; use /exec_hot with a template")
 }
 
+// ---- /jobs persistent queue (NATS JetStream) ----------------------------
+
+#[derive(Deserialize)]
+struct JobPostBody {
+    code: String,
+    #[serde(default = "default_template")]
+    template: String,
+    #[serde(default = "default_timeout")]
+    timeout: u32,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    files: HashMap<String, String>,
+    #[serde(default)]
+    persist_changes: bool,
+    #[serde(default)]
+    persist_root_label: String,
+}
+
+async fn jobs_post(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<JobPostBody>,
+) -> Result<AxumJson<serde_json::Value>, (StatusCode, String)> {
+    let jobs = state.jobs.as_ref().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "queue disabled".into()))?;
+    let job_id = jobs::new_job_id();
+    let spec = jobs::JobSpec {
+        job_id: job_id.clone(),
+        template: body.template.clone(),
+        code: body.code,
+        timeout: body.timeout,
+        env: body.env,
+        files: body.files,
+        persist_changes: body.persist_changes,
+        persist_root_label: body.persist_root_label,
+    };
+    let st = jobs::JobState {
+        job_id: job_id.clone(),
+        status: "pending".into(),
+        template: body.template,
+        created_at: jobs::now_rfc3339(),
+        started_at: None, completed_at: None, error: None, result: None,
+    };
+    jobs::put_state(jobs, &st).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("kv put: {}", e)))?;
+    jobs::publish_job(jobs, &spec).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("publish: {}", e)))?;
+    Ok(AxumJson(json!({ "job_id": job_id, "status": "pending" })))
+}
+
+async fn jobs_get(
+    State(state): State<Arc<AppState>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<AxumJson<jobs::JobState>, (StatusCode, String)> {
+    let jobs = state.jobs.as_ref().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "queue disabled".into()))?;
+    let st = jobs::get_state(jobs, &job_id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("kv get: {}", e)))?
+        .ok_or((StatusCode::NOT_FOUND, format!("job {} not found", job_id)))?;
+    Ok(AxumJson(st))
+}
+
+async fn jobs_delete(
+    State(state): State<Arc<AppState>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let jobs = state.jobs.as_ref().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "queue disabled".into()))?;
+    let mut st = jobs::get_state(jobs, &job_id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("kv get: {}", e)))?
+        .ok_or((StatusCode::NOT_FOUND, format!("job {} not found", job_id)))?;
+    if st.status == "done" || st.status == "failed" || st.status == "cancelled" {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    st.status = "cancelled".into();
+    st.completed_at = Some(jobs::now_rfc3339());
+    jobs::put_state(jobs, &st).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("kv put: {}", e)))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn run_job_consumer(state: Arc<AppState>) -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+    use async_nats::jetstream::consumer::pull;
+    let jobs_h = state.jobs.as_ref().ok_or_else(|| anyhow!("no jobs handle"))?.clone();
+    let consumer = jobs_h.stream.get_or_create_consumer(
+        jobs::CONSUMER_NAME,
+        pull::Config {
+            durable_name: Some(jobs::CONSUMER_NAME.into()),
+            max_deliver: 5,
+            ack_wait: Duration::from_secs(300),
+            ..Default::default()
+        },
+    ).await.map_err(|e| anyhow!("create consumer: {}", e))?;
+    eprintln!("[api] job consumer subscribed");
+
+    let mut messages = consumer.messages().await
+        .map_err(|e| anyhow!("messages stream: {}", e))?;
+    while let Some(msg) = messages.next().await {
+        let msg = match msg { Ok(m) => m, Err(e) => { eprintln!("[api] consumer next: {}", e); continue; } };
+        let state_c = state.clone();
+        let jobs_c = jobs_h.clone();
+        tokio::spawn(async move {
+            let spec: jobs::JobSpec = match serde_json::from_slice(&msg.payload) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[api] bad job payload: {}", e);
+                    let _ = msg.ack().await;
+                    return;
+                }
+            };
+            // Check for cancellation.
+            if let Ok(Some(st)) = jobs::get_state(&jobs_c, &spec.job_id).await {
+                if st.status == "cancelled" {
+                    let _ = msg.ack().await;
+                    return;
+                }
+            }
+            let mut st = jobs::JobState {
+                job_id: spec.job_id.clone(),
+                status: "running".into(),
+                template: spec.template.clone(),
+                created_at: jobs::now_rfc3339(),
+                started_at: Some(jobs::now_rfc3339()),
+                completed_at: None, error: None, result: None,
+            };
+            let _ = jobs::put_state(&jobs_c, &st).await;
+
+            let outcome = execute_job_spec(&state_c, &spec).await;
+            st.completed_at = Some(jobs::now_rfc3339());
+            match outcome {
+                Ok(r) => {
+                    st.status = "done".into();
+                    st.result = Some(r);
+                }
+                Err(e) => {
+                    st.status = "failed".into();
+                    st.error = Some(format!("{}", e));
+                }
+            }
+            let _ = jobs::put_state(&jobs_c, &st).await;
+            let _ = msg.ack().await;
+        });
+    }
+    Ok(())
+}
+
+async fn execute_job_spec(state: &AppState, spec: &jobs::JobSpec) -> anyhow::Result<jobs::JobResult> {
+    let rt = state.registry.acquire(&spec.template).await
+        .map_err(|e| anyhow!("acquire template '{}': {}", spec.template, e))?;
+    let timeout_s = spec.timeout.min(state.max_timeout).max(1) as u64;
+    let start = Instant::now();
+    let _permit = rt.sem.acquire().await.map_err(|e| anyhow!("sem: {}", e))?;
+    let socket = rt.pick_path().to_path_buf();
+    let job = pb::Job {
+        code: spec.code.clone(),
+        timeout: spec.timeout,
+        env: spec.env.clone(),
+        files: spec.files.clone(),
+        persist_changes: spec.persist_changes,
+        persist_root_label: spec.persist_root_label.clone(),
+    };
+    let batch = rt.cfg.pool_size as usize;
+    let exec = exec_direct(state, &socket, job, batch, Duration::from_secs(timeout_s + 10)).await
+        .map_err(|e| anyhow!("worker: {}", e))?;
+    Ok(jobs::JobResult {
+        stdout: exec.stdout,
+        stderr: exec.stderr,
+        exit_code: exec.exit_code,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        container_id: rt.cfg.name.clone(),
+        output_files: exec.output_files,
+        deleted_files: exec.deleted_files,
+        output_files_b64: exec.output_files_b64,
+    })
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let templates_dir = PathBuf::from(
@@ -954,6 +1132,26 @@ async fn main() -> Result<()> {
         cfg_map.len(), hot_limit, warm_limit);
     let registry = Arc::new(PagedRegistry::new(docker, cfg_map, hot_limit, warm_limit));
 
+    // Optionally connect to NATS JetStream for the /jobs queue.
+    let jobs_handle = match std::env::var("MINDBOX_NATS_URL") {
+        Ok(url) if !url.is_empty() => {
+            match jobs::connect(&url).await {
+                Ok(j) => {
+                    eprintln!("[api] NATS JetStream connected: {} (stream + KV ready)", url);
+                    Some(Arc::new(j))
+                }
+                Err(e) => {
+                    eprintln!("[api] WARN: NATS connect failed ({}); /jobs disabled", e);
+                    None
+                }
+            }
+        }
+        _ => {
+            eprintln!("[api] MINDBOX_NATS_URL not set; /jobs disabled");
+            None
+        }
+    };
+
     let state = Arc::new(AppState {
         registry,
         unix_pools: dashmap::DashMap::new(),
@@ -961,16 +1159,32 @@ async fn main() -> Result<()> {
         lease_locks: dashmap::DashMap::new(),
         pool_cap_per_path,
         max_timeout,
+        jobs: jobs_handle.clone(),
     });
-    let app = Router::new()
+
+    if jobs_handle.is_some() {
+        let state_c = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_job_consumer(state_c).await {
+                eprintln!("[api] job consumer exited: {}", e);
+            }
+        });
+    }
+
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/templates", get(list_templates))
         .route("/stats", get(stats_handler))
         .route("/metrics", get(metrics_handler))
         .route("/admin/drain", post(admin_drain))
         .route("/exec_hot", post(exec_hot))
-        .route("/exec", post(exec_cold))
-        .with_state(state);
+        .route("/exec", post(exec_cold));
+    if jobs_handle.is_some() {
+        app = app
+            .route("/jobs", post(jobs_post))
+            .route("/jobs/:id", get(jobs_get).delete(jobs_delete));
+    }
+    let app = app.with_state(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = {
