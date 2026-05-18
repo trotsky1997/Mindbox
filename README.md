@@ -1,31 +1,83 @@
-# inspect-api
+# Mindbox
 
-Sandbox-as-a-service for executing user-supplied Python code with low latency.
-Internal training use; isolation is process-level only (no security sandbox).
+E2B-compatible hot-pool sandbox backend for executing user-supplied Python code
+with sub-millisecond hot-path latency. Internal training use; isolation is
+process-level only (no security sandbox).
+
+**Single host**: ~20.5K RPS at the `/exec_hot` endpoint (Xeon 8582C, 48 cores),
+plus a Connect-protocol E2B shim that lets unmodified `e2b` SDKs use this
+fleet as their backend.
 
 ## Architecture
 
 ```
-            ┌─────────────────┐
-   client ─►│   api-rust      │   (axum, single binary, port 8000)
-            │   :8000         │   loads templates/*/template.toml at boot,
-            └────┬────────────┘   starts N hot containers per template,
-                 │ unix socket     routes /exec_hot by template name.
-                 │ 4-byte len + JSON frame (no HTTP)
-       ┌─────────┼─────────────┐
-       ▼         ▼             ▼
-  ┌────────┐ ┌────────┐    ┌────────┐
-  │ worker │ │ worker │ …  │ worker │   inspect-tpl-<name>:latest
-  │ -rust  │ │ -rust  │    │ -rust  │   --network none + bind-mount /sockets/
-  └───┬────┘ └───┬────┘    └───┬────┘   tokio runtime + std forker thread
-      │ socketpair (sync framed)
-      ▼ ▼ ▼ ▼ (POOL_SIZE child processes per container)
-   ┌──┐ ┌──┐ ┌──┐ ┌──┐
-   │py│ │py│ │py│ │py│  each child = fresh Python interpreter, forked from
-   └──┘ └──┘ └──┘ └──┘  parent (embedded via PyO3, prewarm CoW-shared).
-                       Each child handles up to MAX_REQS requests then exits;
-                       parent's forker thread replenishes the pool.
+                       client (HTTP)
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │   api-rust      │  axum on :8000
+                   │   :8000         │  loads templates/*/template.toml,
+                   └────┬────────────┘  starts N hot containers per template.
+                        │
+            lease via   │  (once, at first request per container)
+            SCM_RIGHTS  │   → api-rust receives N child socketpair fds
+                        ▼
+   ╔═════════════════════════════════════════════════════════════╗
+   ║                    worker container                         ║   inspect-tpl-<name>:latest
+   ║                                                             ║   --network none + bind-mount /sockets/
+   ║   ┌────────────┐  fork()s at startup;                       ║
+   ║   │ worker-rust│  supervises children;                      ║
+   ║   │  (parent)  │  out of hot path after lease.              ║
+   ║   └────┬───────┘                                            ║
+   ║        │ socketpair fds (one per child)                     ║
+   ║        ▼                                                    ║
+   ║    ┌──┐ ┌──┐ ┌──┐ ┌──┐   each child = fresh Python          ║
+   ║    │py│ │py│ │py│ │py│   interpreter, forked from parent    ║
+   ║    └─▲┘ └─▲┘ └─▲┘ └─▲┘   (CoW-shared prewarm via PyO3).     ║
+   ╚══════│════│════│════│═══════════════════════════════════════╝
+          │    │    │    │
+          └────┴────┴────┴── direct write/read from api-rust on the
+                              hot path. Child handles ≤MAX_REQS reqs
+                              then exits; api-rust requests refill via
+                              the same control socket (cmd="refill").
 ```
+
+The hot path (request → child) involves zero work in the worker parent —
+api-rust holds the child's parent-end socketpair fd directly, sent over via
+SCM_RIGHTS at lease time. Parent stays in the **cold** path: fork supervision,
+refill on child death, health/stats/drain.
+
+## Quick start (Docker)
+
+```bash
+# Build the combined image (both api-rust and e2b-shim binaries)
+docker build -t mindbox .
+
+# Run both services in one container. Requires docker.sock for managing
+# template containers; share /opt/inspect-api/sockets/ since worker containers
+# bind-mount the same host path.
+docker run -d --name mindbox \
+  -p 8000:8000 -p 8001:8001 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /opt/inspect-api/sockets:/opt/inspect-api/sockets \
+  -v $PWD/templates:/opt/inspect-api/templates:ro \
+  -v mindbox-shim-state:/var/lib/e2b-shim \
+  -e INSPECT_API_TEMPLATES_DIR=/opt/inspect-api/templates \
+  mindbox
+
+# Build a template image (once per template name)
+docker exec mindbox template-build default
+
+# Smoke test the inspect-api endpoint
+curl -X POST http://localhost:8000/exec_hot \
+  -H "Content-Type: application/json" \
+  -d '{"template":"default","code":"print(2+2)"}'
+# → {"stdout":"4\n","exit_code":0,"elapsed_ms":1,...}
+```
+
+For separate api-only or shim-only deployment, use the per-service Dockerfiles:
+`api-rust/Dockerfile` and `e2b-shim/Dockerfile`. The combined image accepts
+`MINDBOX_MODE=api|shim|both` (default `both`) to select what to run.
 
 ## Endpoints (api-rust on :8000)
 
@@ -39,12 +91,12 @@ Internal training use; isolation is process-level only (no security sandbox).
 | POST   | /exec_hot      | `{"template":"...","code":"...","timeout":N,"env":{},"files":{}}` | stdout/stderr/exit_code/elapsed_ms |
 | POST   | /exec          | (cold path, currently 503) | — |
 
-Per-container worker-rust also exposes the same /health /stats /admin/drain /exec_hot
-routes on its randomly-assigned host port.
+Worker-rust speaks only unix-socket protobuf (no HTTP) — `proto/inspect.proto`.
+api-rust translates HTTP→protobuf and back; users never touch the worker directly.
 
 ## Templates
 
-Each template is a directory under `/opt/inspect-api/templates/`:
+Each template is a directory under `templates/`:
 
 ```
 templates/data-science/
@@ -68,15 +120,14 @@ engine = "rust"                # rust (default) or python (fallback)
 
 Build a template image:
 ```bash
-cd /opt/inspect-api
-template-build <name>           # build one
-template-build default data-science  # multiple
+./template-builder/target/release/template-build <name>            # build one
+./template-builder/target/release/template-build default data-science   # multiple
 ```
 
 The build script picks the worker binary from `worker-rust/target/release/worker-rust`.
 If you change `worker-rust/src/*` or `sandbox_helper.py`, rebuild it first:
 ```bash
-cd /opt/inspect-api/worker-rust && cargo build --release
+cd worker-rust && cargo build --release
 ```
 
 ## ENV vars
@@ -91,7 +142,6 @@ cd /opt/inspect-api/worker-rust && cargo build --release
 ### worker-rust (baked into image via Dockerfile from template.toml)
 | Var | Default | Purpose |
 |---|---|---|
-| `WORKER_PORT` | 8000 | HTTP port (container-internal) |
 | `WORKER_POOL_SIZE` | 32 | pre-fork pool size |
 | `WORKER_MAX_TIMEOUT` | 60 | hard cap on user code timeout |
 | `WORKER_PREWARM_MODULES` | `""` | comma-separated module names to import in parent |
@@ -104,32 +154,52 @@ cd /opt/inspect-api/worker-rust && cargo build --release
 | `WORKER_GC_EVERY_N` | 5 | `gc.collect()` every N requests in each child |
 
 
-## Wire protocol (api <-> worker)
+## Wire protocol (api ↔ worker)
 
 api-rust connects to each worker container's unix socket
 (`/opt/inspect-api/sockets/<tpl>-<idx>-<ns>/worker.sock`) and exchanges
-length-prefixed JSON frames. No HTTP between them.
+length-prefixed protobuf frames (`proto/inspect.proto`). No HTTP between them.
 
-| `_cmd` value | Behavior |
-|---|---|
-| absent / `"exec"` | run user code (`code`, `timeout`, `env`, `files`) |
-| `"health"` | return `{ok, pid, pool_size, idle, prewarm}` |
-| `"stats"` | full stats blob |
-| `"drain"` | drain children: `{pid?, reason?}` |
+| `cmd` value | Hot path? | Behavior |
+|---|---|---|
+| `"lease"` (`lease_count=N`) | once at startup | parent hands out N child socketpair fds via SCM_RIGHTS in one `recvmsg`. api-rust holds these for direct exec from then on. |
+| `"refill"` | on child expire | hand out 1 new child fd via SCM_RIGHTS to replace one that exited. |
+| `"exec"` | legacy fallback | parent dispatches Job to a child and forwards ChildResponse back. Kept for compat; current api-rust hot path bypasses it. |
+| `"health"` | — | `{ok, pid, pool_size, idle, prewarm}` |
+| `"stats"` | — | full stats blob |
+| `"drain"` | — | drain children: `{pid?, reason?}` |
 
-Connections are pooled per-socket-path in api-rust (cap
-`INSPECT_API_UNIX_POOL_PER_PATH=64`).
+After `lease`, api-rust uses each child's parent-end fd directly:
+length-prefixed `pb::Job` in → length-prefixed `pb::ChildResponse` out, no
+parent involvement. On `ChildResponse.expire`, api-rust closes the fd (child
+exits) and sends `refill` to replenish.
+
+**SCM_RIGHTS gotcha**: the cmsg attaches to the FIRST byte of the message. The
+receiver must do a single `recvmsg` covering both the 4-byte length header and
+the protobuf payload; splitting across two reads silently drops the cmsg.
+
+Worker-control connections (the lease/refill channel) are pooled per-socket-path
+in api-rust (`INSPECT_API_UNIX_POOL_PER_PATH=64`).
 
 ## Operations
 
+Bare-metal (install path is `/opt/inspect-api/`):
+
 ```bash
-/opt/inspect-api/start.sh    # tmux session "inspect-api"
-/opt/inspect-api/stop.sh     # kills tmux + removes hot containers
-/opt/inspect-api/status.sh   # tmux state + /health + container list
+./start.sh    # tmux session "inspect-api"; runs api-rust + e2b-shim
+./stop.sh     # kills tmux + removes hot containers + stray shim
+./status.sh   # tmux state + api/shim /health + container list
 tmux attach -t inspect-api   # see live logs
+
+INSPECT_API_REPLICAS=N ./start.sh     # multi-instance SO_REUSEPORT (N panes)
+INSPECT_API_ENABLE_SHIM=0 ./start.sh  # skip e2b-shim pane
 ```
 
-API log goes to `/opt/inspect-api/server.log`.
+Docker: see "Quick start" above. The combined image runs both services under
+tini; signal handling + zombie reaping work correctly. See `Dockerfile` for
+the supervisor script.
+
+API log → `server.log`; shim log → `shim.log`.
 
 ## Lifecycle invariants
 
@@ -183,14 +253,21 @@ API log goes to `/opt/inspect-api/server.log`.
 ## Benchmark baseline (recorded in `bench-baseline.txt`)
 
 Hardware: 48 CPU (Xeon 8582C), 25 GiB RAM, Docker via socket proxy + userns remap.
+Template: `data-science` (4 containers × pool 32), payload: `print(2+2)`.
 
-| Stage | RPS (wrk -t8 -c64 -d30s `print(1)`) | Notes |
+| Stage | RPS (wrk -t8 -c64) | Notes |
 |---|---|---|
 | Python API + Python prefork | 685 | uvicorn 100% CPU |
 | Rust API + Python worker | 750 | API now 13% CPU; fork-rate ~1K |
-| Rust API + Rust worker (fork-per-req) | 750 | fork-rate ceiling: ~1K syscall/sec system-wide |
+| Rust API + Rust worker (fork-per-req) | 750 | fork-rate ceiling |
 | Rust API + Rust worker REUSE | 5800 | child handles ≤200 reqs before respawn |
 | + full lifecycle (gc, reaper, stats) | 5443 | gc.collect every 5 reqs |
+| + protobuf wire + unix socket | 14500 | replaced HTTP+JSON between api↔worker |
+| + DashMap pools + SO_REUSEPORT | 15000 | sharded contention |
+| **+ FD-passing direct path** | **20500** (+37%) | **api-rust → child fd directly; worker parent out of hot path** |
+
+Negative result: tokio-uring migration on worker IO → +3% (within noise),
+rolled back. Epoll wasn't the bottleneck; fork rate is the new ceiling at ~20K.
 
 ## Troubleshooting
 
@@ -206,20 +283,6 @@ code is hanging past `timeout+5s` and forcing parent SIGKILL.
 
 **Empty `/health`:** the tmux session may have died. `status.sh` or
 `tmux attach -t inspect-api` to see what happened.
-
-## Files of interest
-
-```
-/opt/inspect-api/
-├── api-rust/           Rust HTTP front-end (bollard for docker control)
-├── worker-rust/        Rust sandbox worker (PyO3 + tokio + axum)
-│   └── src/sandbox_helper.py   Python helper run inside each child
-├── templates/<name>/   Per-template config + optional Dockerfile
-├── template-build.py   Image builder
-├── run.sh start.sh stop.sh status.sh
-├── bench-baseline.txt  Historical benchmark results
-└── server.log          tmux output of the API
-```
 
 ## E2B-compatible shim (e2b-shim on :8001)
 
@@ -348,31 +411,27 @@ message ExecResult {
 `/exec_hot` JSON gains `persist_changes: bool` (default false) and returns `output_files` /
 `deleted_files` only when non-empty.
 
-## Service management
+## Repo layout
 
 ```
-./start.sh        # starts api-rust + e2b-shim in tmux session "inspect-api"
-./stop.sh         # kills tmux session, hot containers, stray shim
-./status.sh       # tmux + container + api/shim health summary
-INSPECT_API_REPLICAS=N ./start.sh        # multi-instance SO_REUSEPORT (N panes)
-INSPECT_API_ENABLE_SHIM=0 ./start.sh     # skip e2b-shim pane
-```
-
-## Repo layout (current)
-
-```
-/opt/inspect-api/
-├── api-rust/                Rust HTTP front-end (bollard + axum)
-├── worker-rust/             Embedded-Python sandbox worker
-│   └── src/sandbox_helper.py     Python helper run inside each fork child
-├── e2b-shim/                E2B-compatible API server
-├── template-builder/        Rust template image builder (replaces template-build.py)
+.
+├── Dockerfile                       Combined image (MINDBOX_MODE=api|shim|both)
+├── api-rust/
+│   ├── Dockerfile                   Per-service image (api-rust only)
+│   └── src/main.rs                  HTTP front-end (axum + bollard), child-fd pool
+├── worker-rust/                     Embedded-Python sandbox worker
+│   └── src/sandbox_helper.py        Python helper run inside each fork child
+├── e2b-shim/
+│   ├── Dockerfile                   Per-service image (e2b-shim only)
+│   └── src/main.rs                  E2B Connect protocol server, sandbox registry
+├── template-builder/                Rust template image builder
 ├── proto/
-│   ├── inspect.proto             api ↔ worker
-│   └── envd/{process,filesystem}.proto    E2B envd protocol (vendored)
-├── templates/<name>/        Per-template config (template.toml + optional Dockerfile)
-├── sockets/                 Unix sockets bind-mounted into worker containers
-├── run.sh start.sh stop.sh status.sh
+│   ├── inspect.proto                api ↔ worker (lease/refill/exec)
+│   └── envd/{process,filesystem}.proto  E2B envd protocol (vendored)
+├── templates/<name>/                Per-template config (template.toml + optional Dockerfile)
+├── start.sh stop.sh status.sh run.sh
+├── patch-e2b-sdk.sh                 One-shot: drop debug-mode kill/timeout no-ops
 ├── grafana-dashboard.json
+├── bench-baseline.txt               Historical perf log + experiment results
 └── README.md
 ```
