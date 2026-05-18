@@ -259,3 +259,12 @@ Transfer/sec:      2.56MB
 ##               exec_direct() bypasses worker parent on hot path
 ##               child_fd_pools<PathBuf, VecDeque<UnixStream>> per container
 ##   - nix deps: 0.29 with feature "uio"
+
+##
+## 2026-05-19 re-verify after queue revert
+## ----------------------------------------
+## first wrk run after restart: 18,517 RPS (cold path warmup, not representative)
+## 3 consecutive 15s runs once warm:
+##   20,151 / 20,144 / 20,155 RPS  (sd < 6 RPS, ~2% under original 20,588)
+## Conclusion: no regression from the queue add-and-revert cycle. 18.5K was
+## cold-start noise. Bench protocol: do one 10s wrk warmup before recording.
