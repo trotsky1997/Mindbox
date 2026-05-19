@@ -29,6 +29,8 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/inspect.rs"));
 }
 
+use axum::extract::Path as AxumPath;
+
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 const SOCKET_ROOT: &str = "/opt/inspect-api/sockets";
 
@@ -968,6 +970,86 @@ async fn exec_cold() -> impl IntoResponse {
         "/exec (cold path) not implemented; use /exec_hot with a template")
 }
 
+// ---- /admin/build/:name (streaming log) ---------------------------------
+
+#[derive(Deserialize, Default)]
+struct BuildQuery {
+    #[serde(default)]
+    push: bool,
+    #[serde(default)]
+    push_tag: Option<String>,
+}
+
+async fn admin_build(
+    AxumPath(name): AxumPath<String>,
+    axum::extract::Query(q): axum::extract::Query<BuildQuery>,
+) -> impl IntoResponse {
+    use tokio::io::AsyncBufReadExt;
+    use tokio::process::Command as TCommand;
+    use tokio_stream::wrappers::ReceiverStream;
+    use std::process::Stdio;
+    use bytes::Bytes;
+
+    // Sanity-check name (no /, ..).
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return (StatusCode::BAD_REQUEST, "bad template name").into_response();
+    }
+
+    let mut args: Vec<String> = vec![name.clone()];
+    if q.push {
+        args.push("--push".into());
+        if let Some(t) = q.push_tag {
+            if !t.is_empty() { args.push("--push-tag".into()); args.push(t); }
+        }
+    }
+
+    let mut child = match TCommand::new("template-build")
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                          format!("spawn template-build: {}", e)).into_response(),
+    };
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+
+    let tx_out = tx.clone();
+    tokio::spawn(async move {
+        let mut br = tokio::io::BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = br.next_line().await {
+            let _ = tx_out.send(Ok(Bytes::from(format!("{}\n", line)))).await;
+        }
+    });
+    let tx_err = tx.clone();
+    tokio::spawn(async move {
+        let mut br = tokio::io::BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = br.next_line().await {
+            let _ = tx_err.send(Ok(Bytes::from(format!("stderr: {}\n", line)))).await;
+        }
+    });
+    tokio::spawn(async move {
+        let status = child.wait().await;
+        let exit = match status {
+            Ok(s) => s.code().unwrap_or(-1),
+            Err(_) => -1,
+        };
+        let _ = tx.send(Ok(Bytes::from(format!("\n=== exit {} ===\n", exit)))).await;
+    });
+
+    let body = axum::body::Body::from_stream(ReceiverStream::new(rx));
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header("x-content-type-options", "nosniff")
+        .body(body)
+        .unwrap()
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let templates_dir = PathBuf::from(
@@ -1011,6 +1093,7 @@ async fn main() -> Result<()> {
         .route("/stats", get(stats_handler))
         .route("/metrics", get(metrics_handler))
         .route("/admin/drain", post(admin_drain))
+        .route("/admin/build/:name", post(admin_build))
         .route("/exec_hot", post(exec_hot))
         .route("/exec", post(exec_cold))
         .with_state(state);

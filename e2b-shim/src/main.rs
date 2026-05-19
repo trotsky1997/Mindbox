@@ -153,6 +153,26 @@ struct AppState {
     http: reqwest::Client,
     api_key: Option<String>,
     tos: Option<Arc<TosConfig>>,
+    template_builds: DashMap<String, Arc<TemplateBuild>>,
+    template_id_to_build: DashMap<String, String>,
+}
+
+#[derive(Debug)]
+struct TemplateBuild {
+    template_id: String,
+    build_id: String,
+    name: String,
+    status: tokio::sync::Mutex<BuildStatus>,
+    logs: tokio::sync::Mutex<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BuildStatus {
+    Pending,
+    Building,
+    Ready,
+    Error,
 }
 
 struct TosConfig {
@@ -1093,6 +1113,329 @@ async fn sandbox_snapshot(
 }
 
 
+// ---- E2B template build bridge -----------------------------------------
+//
+// Maps the E2B SDK Template.build() flow onto our api-rust /admin/build:
+//   1. POST /v3/templates                — create metadata, return ids
+//   2. GET  /templates/<id>/files/<hash> — file dedup probe (we always say
+//      "missing" and hand back our own presigned URL → /v1/files/<token>)
+//   3. PUT  /v1/files/<token>            — receive a file (one COPY input)
+//   4. POST /v2/templates/<id>/builds/<bid> — start build with steps[]
+//   5. GET  /templates/<id>/builds/<bid>/status — poll
+//   6. GET  /templates/<id>/builds/<bid>/logs   — stream
+//
+// Files staged at /var/lib/e2b-shim/template-builds/<build_id>/files/<hash>.
+// Once build starts we emit a Dockerfile under /opt/inspect-api/templates/<name>/
+// (computed from steps), copy uploaded files into context, then call
+// api-rust POST /admin/build/<name> and stream the response into the build's
+// log buffer.
+
+const STAGING_ROOT: &str = "/var/lib/e2b-shim/template-builds";
+const TEMPLATES_ROOT: &str = "/opt/inspect-api/templates";
+
+fn new_template_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    format!("t{:020}", n)
+}
+fn new_build_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    format!("b{:020}", n)
+}
+
+fn sanitize_name(raw: &str) -> String {
+    // Strip ":tag" if present, then keep [a-zA-Z0-9._-].
+    let head = raw.split(':').next().unwrap_or(raw);
+    let mut out = String::with_capacity(head.len());
+    for c in head.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+            out.push(c);
+        }
+    }
+    if out.is_empty() { "tpl".into() } else { out }
+}
+
+#[derive(Deserialize, Default)]
+struct TemplateBuildRequestV3 {
+    #[serde(default)] alias: Option<String>,
+    #[serde(default)] name: Option<String>,
+    #[serde(default, rename = "cpuCount")] cpu_count: Option<u32>,
+    #[serde(default, rename = "memoryMB")] memory_mb: Option<u32>,
+    #[serde(default)] tags: Option<Vec<String>>,
+    #[serde(default, rename = "teamID")] team_id: Option<String>,
+}
+
+async fn templates_create_v3(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<TemplateBuildRequestV3>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let raw_name = body.name.or(body.alias).unwrap_or_else(|| "tpl".to_string());
+    let name = sanitize_name(&raw_name);
+    let template_id = new_template_id();
+    let build_id = new_build_id();
+    let tb = Arc::new(TemplateBuild {
+        template_id: template_id.clone(),
+        build_id: build_id.clone(),
+        name: name.clone(),
+        status: tokio::sync::Mutex::new(BuildStatus::Pending),
+        logs: tokio::sync::Mutex::new(Vec::new()),
+    });
+    state.template_builds.insert(build_id.clone(), tb);
+    state.template_id_to_build.insert(template_id.clone(), build_id.clone());
+    let _ = std::fs::create_dir_all(format!("{}/{}/files", STAGING_ROOT, build_id));
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({
+        "aliases": body.tags.clone().unwrap_or_default(),
+        "buildID": build_id,
+        "names": [&name],
+        "public": false,
+        "tags": body.tags.unwrap_or_default(),
+        "templateID": template_id,
+    }))))
+}
+
+#[derive(Deserialize)]
+struct FilesHashPath { template_id: String, hash: String }
+
+async fn templates_files_hash(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((template_id, hash)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let build_id = state.template_id_to_build.get(&template_id)
+        .map(|v| v.clone())
+        .ok_or((StatusCode::NOT_FOUND, format!(r#"{{"code":"not_found","message":"template {}"}}"#, template_id)))?;
+    let token = format!("{}:{}", build_id, hash);
+    let url = format!("/v1/files/{}", urlencoding_encode(&token));
+    // Always say missing; let SDK upload to our presigned URL.
+    Ok(Json(serde_json::json!({
+        "present": false,
+        "url": url,
+    })))
+}
+
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn urlencoding_decode(s: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i+1..i+3]).ok()?;
+            let v = u8::from_str_radix(hex, 16).ok()?;
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+async fn files_upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    body: bytes::Bytes,
+) -> Result<StatusCode, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let raw = urlencoding_decode(&token).unwrap_or(token);
+    let (build_id, hash) = raw.split_once(':').ok_or((StatusCode::BAD_REQUEST, "bad token".into()))?;
+    if !state.template_builds.contains_key(build_id) {
+        return Err((StatusCode::NOT_FOUND, format!("unknown build {}", build_id)));
+    }
+    let dir = format!("{}/{}/files", STAGING_ROOT, build_id);
+    let _ = std::fs::create_dir_all(&dir);
+    let dst = format!("{}/{}", dir, hash);
+    std::fs::write(&dst, &body)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {}", e)))?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize, Debug)]
+struct TemplateStepV2 {
+    #[serde(rename = "type")] type_: String,
+    #[serde(default)] args: Vec<String>,
+    #[serde(default, rename = "filesHash")] files_hash: Option<String>,
+    #[serde(default)] force: bool,
+}
+
+#[derive(Deserialize, Debug)]
+struct TemplateBuildStartV2 {
+    #[serde(default)] force: bool,
+    #[serde(default, rename = "fromImage")] from_image: Option<String>,
+    #[serde(default, rename = "fromTemplate")] from_template: Option<String>,
+    #[serde(default, rename = "readyCmd")] ready_cmd: Option<String>,
+    #[serde(default, rename = "startCmd")] start_cmd: Option<String>,
+    #[serde(default)] steps: Vec<TemplateStepV2>,
+}
+
+async fn templates_build_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((template_id, build_id)): Path<(String, String)>,
+    Json(body): Json<TemplateBuildStartV2>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let tb = state.template_builds.get(&build_id)
+        .map(|v| v.clone())
+        .ok_or((StatusCode::NOT_FOUND, format!("build {} not found", build_id)))?;
+    if tb.template_id != template_id {
+        return Err((StatusCode::BAD_REQUEST, format!("template/build mismatch")));
+    }
+
+    // Materialise template dir + Dockerfile + template.toml + copy files.
+    let tpl_dir = format!("{}/{}", TEMPLATES_ROOT, tb.name);
+    let _ = std::fs::create_dir_all(&tpl_dir);
+
+    let base = body.from_image.clone()
+        .or(body.from_template.clone().map(|t| format!("inspect-tpl-{}:latest", t)))
+        .unwrap_or_else(|| "python:3.12-slim".into());
+
+    let mut dockerfile = format!("FROM {}\n", base);
+    for step in &body.steps {
+        match step.type_.to_ascii_uppercase().as_str() {
+            "COPY" => {
+                if let (Some(hash), Some(dst)) = (step.files_hash.as_ref(), step.args.last()) {
+                    let src = format!("{}/{}/files/{}", STAGING_ROOT, build_id, hash);
+                    let dst_in_ctx = format!("{}/{}", tpl_dir, hash);
+                    std::fs::copy(&src, &dst_in_ctx)
+                        .map_err(|e| (StatusCode::BAD_REQUEST, format!("missing upload {}: {}", hash, e)))?;
+                    dockerfile.push_str(&format!("COPY {} {}\n", hash, dst));
+                } else {
+                    dockerfile.push_str(&format!("COPY {}\n", step.args.join(" ")));
+                }
+            }
+            "RUN" | "ENV" | "WORKDIR" | "USER" | "EXPOSE" | "ARG" | "LABEL" | "CMD" | "ENTRYPOINT" => {
+                dockerfile.push_str(&format!("{} {}\n", step.type_.to_ascii_uppercase(), step.args.join(" ")));
+            }
+            other => {
+                // Unknown step: emit as comment.
+                dockerfile.push_str(&format!("# UNKNOWN STEP {}: {}\n", other, step.args.join(" ")));
+            }
+        }
+    }
+    if let Some(c) = &body.start_cmd { dockerfile.push_str(&format!("CMD {}\n", c)); }
+    let dockerfile_path = format!("{}/Dockerfile", tpl_dir);
+    std::fs::write(&dockerfile_path, &dockerfile)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write Dockerfile: {}", e)))?;
+    let toml_path = format!("{}/template.toml", tpl_dir);
+    if !std::path::Path::new(&toml_path).exists() {
+        let _ = std::fs::write(&toml_path, format!("name = \"{}\"\npool_size = 16\ncontainers = 1\n", tb.name));
+    }
+
+    // Kick off api-rust build, capture log lines into the build buffer.
+    let name = tb.name.clone();
+    let upstream = state.upstream.clone();
+    let http = state.http.clone();
+    let tb_clone = tb.clone();
+    {
+        let mut st = tb.status.lock().await;
+        *st = BuildStatus::Building;
+    }
+    tokio::spawn(async move {
+        let url = format!("{}/admin/build/{}", upstream, urlencoding_encode(&name));
+        let resp = http.post(&url).send().await;
+        let mut resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                let mut s = tb_clone.status.lock().await; *s = BuildStatus::Error;
+                let mut l = tb_clone.logs.lock().await; l.push(format!("[shim] api-rust POST failed: {}", e));
+                return;
+            }
+        };
+        let mut bad = false;
+        if !resp.status().is_success() {
+            bad = true;
+            let mut l = tb_clone.logs.lock().await;
+            l.push(format!("[shim] api-rust returned HTTP {}", resp.status()));
+        }
+        // Stream chunks → log buffer line-by-line.
+        let mut buf: Vec<u8> = Vec::new();
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            buf.extend_from_slice(&chunk);
+            while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+                let line = String::from_utf8_lossy(&buf[..nl]).to_string();
+                buf.drain(..=nl);
+                if line.contains("=== exit ") {
+                    let exit_ok = line.contains("=== exit 0 ===");
+                    let mut s = tb_clone.status.lock().await;
+                    *s = if exit_ok && !bad { BuildStatus::Ready } else { BuildStatus::Error };
+                }
+                let mut l = tb_clone.logs.lock().await;
+                l.push(line);
+            }
+        }
+        if !buf.is_empty() {
+            let mut l = tb_clone.logs.lock().await;
+            l.push(String::from_utf8_lossy(&buf).to_string());
+        }
+        // Defensive: if no exit marker observed, finalize.
+        let need_finalize = {
+            let s = tb_clone.status.lock().await;
+            matches!(*s, BuildStatus::Building)
+        };
+        if need_finalize {
+            let mut s = tb_clone.status.lock().await;
+            *s = if bad { BuildStatus::Error } else { BuildStatus::Ready };
+        }
+    });
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn templates_build_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((_template_id, build_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let tb = state.template_builds.get(&build_id)
+        .map(|v| v.clone())
+        .ok_or((StatusCode::NOT_FOUND, format!("build {} not found", build_id)))?;
+    let st = tb.status.lock().await;
+    let st_str = match *st {
+        BuildStatus::Pending => "waiting",
+        BuildStatus::Building => "building",
+        BuildStatus::Ready => "ready",
+        BuildStatus::Error => "error",
+    };
+    Ok(Json(serde_json::json!({
+        "status": st_str,
+        "templateID": tb.template_id,
+        "buildID": tb.build_id,
+    })))
+}
+
+async fn templates_build_logs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((_template_id, build_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let tb = state.template_builds.get(&build_id)
+        .map(|v| v.clone())
+        .ok_or((StatusCode::NOT_FOUND, format!("build {} not found", build_id)))?;
+    let logs = tb.logs.lock().await;
+    Ok(Json(serde_json::json!({
+        "logs": logs.clone(),
+    })))
+}
+
+
 // ---- main ---------------------------------------------------------------
 
 #[tokio::main]
@@ -1121,6 +1464,8 @@ async fn main() -> Result<()> {
         http: reqwest::Client::builder().http1_only().pool_max_idle_per_host(64).build()?,
         api_key,
         tos,
+        template_builds: DashMap::new(),
+        template_id_to_build: DashMap::new(),
     });
     for rec in prior {
         let sid = rec.sandbox_id.clone();
@@ -1134,6 +1479,14 @@ async fn main() -> Result<()> {
         .route("/sandboxes/:id", get(get_sandbox).delete(delete_sandbox))
         .route("/sandboxes/:id/timeout", post(set_sandbox_timeout))
         .route("/sandboxes/:id/snapshot", post(sandbox_snapshot))
+        // E2B template build bridge
+        .route("/v3/templates", post(templates_create_v3))
+        .route("/templates/:tid/files/:hash", get(templates_files_hash))
+        .route("/v1/files/:token", axum::routing::put(files_upload))
+        .route("/v2/templates/:tid/builds/:bid", post(templates_build_start))
+        .route("/templates/:tid/builds/:bid", post(templates_build_start))
+        .route("/templates/:tid/builds/:bid/status", get(templates_build_status))
+        .route("/templates/:tid/builds/:bid/logs", get(templates_build_logs))
         // Connect RPC paths (E2B SDK sends to {base_url}/process.Process/Start)
         .route("/process.Process/Start", post(process_start))
         .route("/process.Process/List", post(process_list))
