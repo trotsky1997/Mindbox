@@ -73,6 +73,12 @@ struct SandboxRec {
     disk_size_mb: u32,
     #[serde(default = "default_state")]
     state: String,
+    /// Which upstream serves this sandbox:
+    ///   "python-pool" → worker-rust fork pool via /exec_hot (legacy)
+    ///   "tools"       → tools-rust daemon via /v2/sessions/:sid/tools/:name
+    /// Detected at create time from the templateID prefix (tools-*).
+    #[serde(default = "default_backend")]
+    backend: String,
 }
 
 fn default_cpu() -> u32 {
@@ -86,6 +92,14 @@ fn default_disk() -> u32 {
 }
 fn default_state() -> String {
     "running".into()
+}
+fn default_backend() -> String {
+    "python-pool".into()
+}
+
+/// True if a template name targets the tools-rust daemon backend.
+fn is_tools_template(template_id: &str) -> bool {
+    template_id == "tools" || template_id.starts_with("tools-")
 }
 
 const SANDBOX_FS_ROOT: &str = "/var/lib/e2b-shim/sandboxes";
@@ -315,41 +329,79 @@ async fn create_sandbox(
     } else {
         body.template_id.clone()
     };
-    // Verify template exists upstream.
-    let url = format!("{}/templates", state.upstream);
-    let resp = state
-        .http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream: {}", e)))?;
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream json: {}", e)))?;
-    let templates = v
-        .get("templates")
-        .and_then(|t| t.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let known: Vec<String> = templates
-        .iter()
-        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
-        .collect();
-    if !known.contains(&template_id) {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!(
-                r#"{{"code":"not_found","message":"template '{}' not found; available: {:?}"}}"#,
-                template_id, known
-            ),
-        ));
-    }
+    let backend = if is_tools_template(&template_id) {
+        "tools".to_string()
+    } else {
+        // python-pool: verify template exists upstream (the /templates list
+        // is python-pool-only at the moment).
+        let url = format!("{}/templates", state.upstream);
+        let resp = state
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream: {}", e)))?;
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream json: {}", e)))?;
+        let templates = v
+            .get("templates")
+            .and_then(|t| t.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let known: Vec<String> = templates
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        if !known.contains(&template_id) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!(
+                    r#"{{"code":"not_found","message":"template '{}' not found; available: {:?}"}}"#,
+                    template_id, known
+                ),
+            ));
+        }
+        "python-pool".to_string()
+    };
 
-    let sid = format!(
-        "i{}",
-        &uuid::Uuid::new_v4().to_string().replace('-', "")[..20]
-    );
+    // For tools backend, the upstream daemon allocates the session id;
+    // we reuse it as the e2b sandbox_id so SDK clients and daemon agree
+    // on a single identifier.
+    let sid = if backend == "tools" {
+        let url = format!("{}/v2/sessions", state.upstream);
+        let resp = state
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "template": template_id }))
+            .send()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream: {}", e)))?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("upstream /v2/sessions: {}", body),
+            ));
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream json: {}", e)))?;
+        v.get("session_id")
+            .and_then(|s| s.as_str())
+            .map(String::from)
+            .ok_or((
+                StatusCode::BAD_GATEWAY,
+                "upstream /v2/sessions: missing session_id".into(),
+            ))?
+    } else {
+        format!(
+            "i{}",
+            &uuid::Uuid::new_v4().to_string().replace('-', "")[..20]
+        )
+    };
     let now = Utc::now();
     let end = now + chrono::Duration::seconds(body.timeout.unwrap_or(900) as i64);
     let rec = SandboxRec {
@@ -372,9 +424,15 @@ async fn create_sandbox(
         memory_mb: 1024,
         disk_size_mb: 4096,
         state: "running".into(),
+        backend: backend.clone(),
     };
-    if let Err(e) = ensure_sandbox_fs(&sid) {
-        eprintln!("[shim] WARN ensure_sandbox_fs({}): {}", sid, e);
+    // python-pool needs a host fs dir under /var/lib/e2b-shim/sandboxes/<sid>
+    // for the Python wrapper's file collection. tools backend lives in the
+    // daemon's own /sandboxes/<sid> so no host-side dir to provision.
+    if backend == "python-pool" {
+        if let Err(e) = ensure_sandbox_fs(&sid) {
+            eprintln!("[shim] WARN ensure_sandbox_fs({}): {}", sid, e);
+        }
     }
     state.sandboxes.insert(sid.clone(), rec.clone());
     persist_sandbox(&rec);
@@ -403,9 +461,20 @@ async fn delete_sandbox(
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
+    let backend = state
+        .sandboxes
+        .get(&sid)
+        .map(|r| r.backend.clone())
+        .unwrap_or_else(default_backend);
     state.sandboxes.remove(&sid);
     forget_sandbox(&sid);
     let _ = std::fs::remove_dir_all(sandbox_fs_dir(&sid));
+    if backend == "tools" {
+        // Best-effort cleanup; ignore errors so a half-stuck upstream
+        // can't keep a sandbox visible to the SDK.
+        let url = format!("{}/v2/sessions/{}", state.upstream, sid);
+        let _ = state.http.delete(&url).send().await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -714,6 +783,22 @@ async fn process_start(
             }
         }
     }
+
+    // Tools backend short-circuit: skip the Python-subprocess wrapper and
+    // forward straight to /v2/sessions/:sid/tools/bash. The cmd + args are
+    // joined into a single shell line (caller's responsibility to quote).
+    let backend = sid
+        .as_ref()
+        .and_then(|s| state.sandboxes.get(s).map(|r| r.backend.clone()))
+        .unwrap_or_else(default_backend);
+    if backend == "tools" {
+        let bash_cmd = if proc_cfg.args.is_empty() {
+            proc_cfg.cmd.clone()
+        } else {
+            format!("{} {}", proc_cfg.cmd, proc_cfg.args.join(" "))
+        };
+        return process_start_tools(state, codec, sid, bash_cmd).await;
+    }
     let sandbox_files: std::collections::HashMap<String, String> = match &sid {
         Some(s) => {
             let root = sandbox_fs_dir(s);
@@ -857,6 +942,134 @@ async fn process_start(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ct_out)
         .header("connect-protocol-version", "1")
+        .body(body)
+        .unwrap()
+}
+
+/// Tools-backend variant of process_start: forward to upstream's
+/// /v2/sessions/:sid/tools/bash and stream the response back as a Connect
+/// process event stream. No Python wrapper, no host-fs serialization —
+/// the daemon manages session state itself.
+async fn process_start_tools(
+    state: Arc<AppState>,
+    codec: Codec,
+    sid: Option<String>,
+    bash_cmd: String,
+) -> Response {
+    let Some(sid) = sid else {
+        return (
+            StatusCode::BAD_REQUEST,
+            r#"{"code":"bad_request","message":"tools backend requires a sandbox_id header"}"#,
+        )
+            .into_response();
+    };
+
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+
+    // Start event so the SDK gets its synthetic pid right away.
+    let start_evt = pb::StartResponse {
+        event: Some(pb::ProcessEvent {
+            event: Some(ProcessEventOneof::Start(StartEvent { pid: 1 })),
+        }),
+    };
+    let _ = tx.send(Ok(enc_resp(&start_evt, codec))).await;
+
+    let upstream = state.upstream.clone();
+    let http = state.http.clone();
+    let tx2 = tx.clone();
+    tokio::spawn(async move {
+        let body = serde_json::json!({ "cmd": bash_cmd, "timeout": 60 });
+        let url = format!("{}/v2/sessions/{}/tools/bash", upstream, sid);
+        let resp = http
+            .post(&url)
+            .json(&body)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                #[derive(serde::Deserialize)]
+                struct BashResp {
+                    stdout: String,
+                    stderr: String,
+                    exit_code: i32,
+                    #[serde(default)]
+                    timed_out: bool,
+                }
+                match r.json::<BashResp>().await {
+                    Ok(u) => {
+                        if !u.stdout.is_empty() {
+                            let evt = pb::StartResponse {
+                                event: Some(pb::ProcessEvent {
+                                    event: Some(ProcessEventOneof::Data(DataEvent {
+                                        output: Some(data_event::Output::Stdout(
+                                            u.stdout.into_bytes(),
+                                        )),
+                                    })),
+                                }),
+                            };
+                            let _ = tx2.send(Ok(enc_resp(&evt, codec))).await;
+                        }
+                        if !u.stderr.is_empty() {
+                            let evt = pb::StartResponse {
+                                event: Some(pb::ProcessEvent {
+                                    event: Some(ProcessEventOneof::Data(DataEvent {
+                                        output: Some(data_event::Output::Stderr(
+                                            u.stderr.into_bytes(),
+                                        )),
+                                    })),
+                                }),
+                            };
+                            let _ = tx2.send(Ok(enc_resp(&evt, codec))).await;
+                        }
+                        let status = if u.timed_out {
+                            format!("timeout (exit {})", u.exit_code)
+                        } else {
+                            format!("exit {}", u.exit_code)
+                        };
+                        let evt = pb::StartResponse {
+                            event: Some(pb::ProcessEvent {
+                                event: Some(ProcessEventOneof::End(EndEvent {
+                                    exit_code: u.exit_code,
+                                    exited: true,
+                                    status,
+                                    error: None,
+                                })),
+                            }),
+                        };
+                        let _ = tx2.send(Ok(enc_resp(&evt, codec))).await;
+                        let _ = tx2.send(Ok(end_envelope_ok())).await;
+                    }
+                    Err(e) => {
+                        let _ = tx2
+                            .send(Ok(end_envelope_err(
+                                "internal",
+                                &format!("upstream json: {}", e),
+                            )))
+                            .await;
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx2
+                    .send(Ok(end_envelope_err(
+                        "unavailable",
+                        &format!("upstream send: {}", e),
+                    )))
+                    .await;
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = Body::from_stream(stream);
+    let ct_out = match codec {
+        Codec::Proto => "application/connect+proto",
+        Codec::Json => "application/connect+json",
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, ct_out)
         .body(body)
         .unwrap()
 }
@@ -2717,6 +2930,7 @@ mod tests {
             memory_mb: 1024,
             disk_size_mb: 4096,
             state: "running".into(),
+            backend: default_backend(),
         };
         let json = serde_json::to_string(&rec).unwrap();
         // Field names are renamed to camelCase E2B-style.
@@ -2726,5 +2940,42 @@ mod tests {
         assert_eq!(back.sandbox_id, "i123");
         assert_eq!(back.cpu_count, 2);
         assert_eq!(back.state, "running");
+        assert_eq!(back.backend, "python-pool");
+    }
+
+    #[test]
+    fn is_tools_template_matches_prefix() {
+        assert!(is_tools_template("tools"));
+        assert!(is_tools_template("tools-default"));
+        assert!(is_tools_template("tools-python-dev"));
+        assert!(!is_tools_template("default"));
+        assert!(!is_tools_template("data-science"));
+        assert!(!is_tools_template(""));
+    }
+
+    #[test]
+    fn default_backend_is_python_pool() {
+        assert_eq!(default_backend(), "python-pool");
+    }
+
+    #[test]
+    fn sandbox_rec_omits_backend_in_legacy_json() {
+        // A stored record from before the backend field existed must still
+        // deserialize (no backend → default_backend).
+        let legacy = r#"{
+            "sandboxID":"i999",
+            "templateID":"default",
+            "clientID":"shim",
+            "domain":null,
+            "envdVersion":"0.5.0",
+            "envdAccessToken":null,
+            "alias":null,
+            "metadata":null,
+            "startedAt":"2026-01-01T00:00:00Z",
+            "endAt":"2026-01-01T01:00:00Z",
+            "state":"running"
+        }"#;
+        let rec: SandboxRec = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.backend, "python-pool");
     }
 }
