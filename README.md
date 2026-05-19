@@ -136,7 +136,7 @@ cd worker-rust && cargo build --release
 | `WORKER_POOL_SIZE` | 32 | pre-fork pool size |
 | `WORKER_MAX_TIMEOUT` | 60 | hard cap on user code timeout |
 | `WORKER_PREWARM_MODULES` | `""` | comma-separated module names to import in parent |
-| `WORKER_REUSE_MAX_REQS` | 200 | child respawns after this many requests |
+| `WORKER_REUSE_MAX_REQS` | 1000 | child respawns after this many requests. Raised from 200 after sys.modules cleanup + per-request tmpdir + read-only rootfs landed (the per-request leakage surface is small enough that respawning every 1000 reqs is fine; lower it if your workload mutates prewarmed module attrs heavily). |
 | `WORKER_REUSE_MAX_RSS_MB` | 1024 | child respawns if RSS exceeds |
 | `WORKER_MAX_AGE_SECONDS` | 600 | reaper drains children older than this |
 | `WORKER_MAX_IDLE_SECONDS` | 120 | reaper drains children idle longer than this |

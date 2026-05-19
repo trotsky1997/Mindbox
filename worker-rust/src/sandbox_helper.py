@@ -72,7 +72,7 @@ _initial_fds = None
 # are dropped).
 _initial_sys_modules = None
 
-_MAX_REQS = int(os.environ.get('WORKER_REUSE_MAX_REQS', '200'))
+_MAX_REQS = int(os.environ.get('WORKER_REUSE_MAX_REQS', '1000'))
 _MAX_RSS_MB = int(os.environ.get('WORKER_REUSE_MAX_RSS_MB', '1024'))
 _MAX_AGE_SEC = int(os.environ.get('WORKER_MAX_AGE_SECONDS', '600'))
 _GC_EVERY_N = int(os.environ.get('WORKER_GC_EVERY_N', '5'))
