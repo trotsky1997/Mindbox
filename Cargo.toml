@@ -5,6 +5,7 @@ members = [
     "e2b-shim",
     "worker-rust",
     "template-builder",
+    "tools-rust",
 ]
 
 # Per-crate [package] / [dependencies] live in each crate's own Cargo.toml.
