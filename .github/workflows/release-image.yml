@@ -24,7 +24,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image metadata
+      # ---------------- mindbox controller image ----------------
+      - name: mindbox image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -34,7 +35,7 @@ jobs:
             type=sha,prefix=,format=short
             type=ref,event=tag
 
-      - name: Build & push
+      - name: Build & push mindbox image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -44,3 +45,36 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # ---------------- tools template image(s) ----------------
+      # template-builder ships inside the mindbox image, so we pull the
+      # just-pushed mindbox image back, run it with its templates dir
+      # bind-mounted, and let template-build emit the template image to
+      # the host docker daemon. Then re-tag for ghcr and push.
+
+      - name: Pull mindbox image back as template builder
+        run: docker pull ghcr.io/${{ github.repository }}:latest
+
+      - name: Build tools-default template image
+        run: |
+          set -e
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v ${{ github.workspace }}/templates:/opt/inspect-api/templates:ro \
+            --entrypoint /usr/local/bin/template-build \
+            ghcr.io/${{ github.repository }}:latest \
+            tools-default
+          # Sanity-check the image exists locally.
+          docker images inspect-tpl-tools-tools-default --format \
+            'built: {{.Repository}}:{{.Tag}} {{.Size}}'
+
+      - name: Tag & push tools-default template image
+        run: |
+          set -e
+          SHA=${GITHUB_SHA::7}
+          TPL=ghcr.io/${{ github.repository }}/tpl-tools-default
+          docker tag inspect-tpl-tools-tools-default:latest "$TPL:latest"
+          docker tag inspect-tpl-tools-tools-default:latest "$TPL:$SHA"
+          docker push "$TPL:latest"
+          docker push "$TPL:$SHA"
+          echo "pushed $TPL:latest + :$SHA"
