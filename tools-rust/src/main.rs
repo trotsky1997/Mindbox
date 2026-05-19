@@ -869,12 +869,18 @@ async fn tool_find(
     let mut paths = Vec::new();
     let mut walked = 0usize;
     let mut truncated = false;
-    for ent in walkdir::WalkDir::new(&target)
+    // ignore::WalkBuilder is what sharkdp/fd uses for the directory walk:
+    // parallel-traversal-capable, gitignore-aware (we disable that with
+    // standard_filters(false) so build artifacts stay visible — agents
+    // often need to grep/find them).
+    let walker = ignore::WalkBuilder::new(&target)
         .follow_links(false)
-        .into_iter()
-        .filter_map(|r| r.ok())
-    {
+        .standard_filters(false)
+        .build();
+    for ent in walker.flatten() {
         walked += 1;
+        // Same 4× over-walk cap as before — wildcard patterns like `**`
+        // on deep trees would otherwise scan unbounded.
         if walked > req.max_results.saturating_mul(4).max(20_000) {
             truncated = true;
             break;
