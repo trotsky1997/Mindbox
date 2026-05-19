@@ -41,10 +41,12 @@ COPY api-rust/ ./api-rust/
 COPY e2b-shim/ ./e2b-shim/
 COPY template-builder/ ./template-builder/
 COPY worker-rust/ ./worker-rust/
+COPY tools-rust/ ./tools-rust/
 RUN cd api-rust && cargo build --release
 RUN cd e2b-shim && cargo build --release
 RUN cd template-builder && cargo build --release
 RUN cd worker-rust && cargo build --release
+RUN cd tools-rust && cargo build --release
 
 FROM debian:bookworm-slim
 ARG COMPOSE_VERSION=v2.32.4
@@ -62,6 +64,9 @@ COPY --from=build /src/template-builder/target/release/template-build /usr/local
 # generated pb2.py into a temp build context. Keep them at the same paths
 # the binary expects on bare-metal install (/opt/inspect-api/...).
 COPY --from=build /src/worker-rust/target/release/worker-rust /opt/inspect-api/worker-rust/target/release/worker-rust
+# Bundle tools-rust the same way: template-builder picks it up at this path
+# when generating a kind="tools" template image.
+COPY --from=build /src/tools-rust/target/release/tools-rust /opt/inspect-api/tools-rust/target/release/tools-rust
 COPY proto/inspect_pb2.py /opt/inspect-api/proto/inspect_pb2.py
 RUN mkdir -p /var/lib/e2b-shim/registry /var/lib/e2b-shim/sandboxes /opt/inspect-api/templates
 COPY <<'ENTRY' /usr/local/bin/mindbox-entrypoint

@@ -1,0 +1,11 @@
+# tools-default — minimal 7-tool template.
+# kind="tools" tells template-builder to build a tools-rust daemon image
+# instead of a worker-rust Python fork-pool image.
+
+name = "tools-default"
+kind = "tools"
+base_image = "debian:bookworm-slim"
+# The build's floor (bash + ripgrep + fd-find + coreutils + findutils +
+# ca-certificates + tini) is added automatically by template-builder;
+# anything you list here is bolted on top.
+extra_apt = []
