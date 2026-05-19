@@ -125,6 +125,58 @@ def _build_resp(stdout, stderr, exit_code, expire, expire_reason, output_files=N
     return resp.SerializeToString()
 
 
+def _snapshot_dir(run_dir):
+    """rel_path -> (mtime_ns, size) for every regular file under run_dir.
+
+    Returns an empty dict when run_dir is None or unwalkable. Stat failures
+    on individual files are swallowed silently to match the prior inline
+    behavior.
+    """
+    out = {}
+    if run_dir is None:
+        return out
+    for _root, _, _fs in os.walk(run_dir):
+        for _f in _fs:
+            _p = os.path.join(_root, _f)
+            try:
+                _st = os.stat(_p)
+                _rel = os.path.relpath(_p, run_dir)
+                out[_rel] = (_st.st_mtime_ns, _st.st_size)
+            except Exception:
+                pass
+    return out
+
+
+def _diff_dir(initial, run_dir):
+    """Compute (changed_text, deleted, changed_binary_b64) vs an `initial` snapshot.
+
+    A file is included in the diff iff its (mtime_ns, size) tuple differs
+    from `initial.get(rel)`. New files (rel not in initial) always differ.
+    Classification: NUL byte in the first 4KB → base64 → changed_binary_b64;
+    otherwise UTF-8 decode with errors='replace' → changed_text. Read errors
+    on individual files are swallowed.
+    """
+    import base64 as _b64
+    final = _snapshot_dir(run_dir)
+    changed_text = {}
+    changed_binary_b64 = {}
+    if run_dir is not None:
+        for rel, meta in final.items():
+            if initial.get(rel) == meta:
+                continue
+            try:
+                with open(os.path.join(run_dir, rel), 'rb') as _fp:
+                    raw = _fp.read()
+                if b'\x00' in raw[:4096]:
+                    changed_binary_b64[rel] = _b64.b64encode(raw).decode('ascii')
+                else:
+                    changed_text[rel] = raw.decode('utf-8', 'replace')
+            except Exception:
+                pass
+    deleted = [r for r in initial.keys() if r not in final]
+    return changed_text, deleted, changed_binary_b64
+
+
 def _run_sandbox_pb(job_bytes):
     global _requests_served, _total_exec_ns, _total_gc_collected
     _ensure_init()
@@ -164,18 +216,8 @@ def _run_sandbox_pb(job_bytes):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content)
             os.chdir(run_dir)
-        # snapshot before exec: rel_path -> (mtime, size)
-        _initial = {}
-        if persist and run_dir is not None:
-            for _root, _, _fs in os.walk(run_dir):
-                for _f in _fs:
-                    _p = os.path.join(_root, _f)
-                    try:
-                        _st = os.stat(_p)
-                        _rel = os.path.relpath(_p, run_dir)
-                        _initial[_rel] = (_st.st_mtime_ns, _st.st_size)
-                    except Exception:
-                        pass
+        # snapshot before exec: rel_path -> (mtime_ns, size)
+        _initial = _snapshot_dir(run_dir) if persist else {}
         if env:
             for k, v in env.items():
                 os.environ[str(k)] = str(v)
@@ -215,33 +257,7 @@ def _run_sandbox_pb(job_bytes):
             except Exception: pass
         if persist and run_dir is not None:
             try:
-                _final = {}
-                for _root, _, _fs in os.walk(run_dir):
-                    for _f in _fs:
-                        _p = os.path.join(_root, _f)
-                        try:
-                            _st = os.stat(_p)
-                            _rel = os.path.relpath(_p, run_dir)
-                            _final[_rel] = (_st.st_mtime_ns, _st.st_size)
-                        except Exception:
-                            pass
-                _changed = {}
-                _changed_bin = {}
-                import base64 as _b64
-                for _rel, _meta in _final.items():
-                    _prev = _initial.get(_rel)
-                    if _prev != _meta:
-                        try:
-                            with open(os.path.join(run_dir, _rel), 'rb') as _fp:
-                                _raw = _fp.read()
-                            if b'\x00' in _raw[:4096]:
-                                _changed_bin[_rel] = _b64.b64encode(_raw).decode('ascii')
-                            else:
-                                _changed[_rel] = _raw.decode('utf-8', 'replace')
-                        except Exception:
-                            pass
-                _deleted = [r for r in _initial.keys() if r not in _final]
-                _persist_out = (_changed, _deleted, _changed_bin)
+                _persist_out = _diff_dir(_initial, run_dir)
             except Exception:
                 _persist_out = ({}, [], {})
         if run_dir is not None:
