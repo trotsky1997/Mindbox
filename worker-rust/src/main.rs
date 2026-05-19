@@ -42,14 +42,24 @@ struct Config {
 
 impl Config {
     fn from_env() -> Self {
-        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let env_u64 = |k: &str, d: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
         Self {
             socket_path: std::env::var("WORKER_SOCKET_PATH")
-                .unwrap_or_else(|_| "/sockets/worker.sock".into()).into(),
+                .unwrap_or_else(|_| "/sockets/worker.sock".into())
+                .into(),
             pool_size: env_u64("WORKER_POOL_SIZE", 32) as usize,
             max_timeout: env_u64("WORKER_MAX_TIMEOUT", 60) as u32,
-            prewarm: std::env::var("WORKER_PREWARM_MODULES").unwrap_or_default()
-                .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            prewarm: std::env::var("WORKER_PREWARM_MODULES")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
             max_age: Duration::from_secs(env_u64("WORKER_MAX_AGE_SECONDS", 600)),
             max_idle: Duration::from_secs(env_u64("WORKER_MAX_IDLE_SECONDS", 120)),
             reaper_interval: Duration::from_secs(env_u64("WORKER_REAPER_INTERVAL_SEC", 5)),
@@ -67,7 +77,9 @@ fn write_all_fd(fd: RawFd, mut buf: &[u8]) -> std::io::Result<()> {
         let r = unsafe { libc::write(fd, buf.as_ptr() as *const _, buf.len()) };
         if r < 0 {
             let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             return Err(e);
         }
         buf = &buf[r as usize..];
@@ -79,10 +91,17 @@ fn read_exact_fd(fd: RawFd, mut buf: &mut [u8]) -> std::io::Result<()> {
         let r = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
         if r < 0 {
             let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             return Err(e);
         }
-        if r == 0 { return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof")); }
+        if r == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "eof",
+            ));
+        }
         buf = &mut buf[r as usize..];
     }
     Ok(())
@@ -96,7 +115,12 @@ fn recv_frame_fd(fd: RawFd) -> std::io::Result<Vec<u8>> {
     let mut hdr = [0u8; 4];
     read_exact_fd(fd, &mut hdr)?;
     let n = u32::from_be_bytes(hdr) as usize;
-    if n > MAX_FRAME { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large")); }
+    if n > MAX_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
     let mut buf = vec![0u8; n];
     read_exact_fd(fd, &mut buf)?;
     Ok(buf)
@@ -110,7 +134,12 @@ async fn recv_frame_async(s: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     let mut hdr = [0u8; 4];
     s.read_exact(&mut hdr).await?;
     let n = u32::from_be_bytes(hdr) as usize;
-    if n > MAX_FRAME { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large")); }
+    if n > MAX_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
     let mut buf = vec![0u8; n];
     s.read_exact(&mut buf).await?;
     Ok(buf)
@@ -123,15 +152,22 @@ const SANDBOX_HELPER_PY: &str = include_str!("sandbox_helper.py");
 // ---- child main: protobuf in, protobuf out ------------------------------
 
 fn child_main(fd: RawFd) -> ! {
-    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL); }
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+    }
     loop {
         let job_bytes = match recv_frame_fd(fd) {
             Ok(b) => b,
-            Err(_) => unsafe { libc::_exit(0); },
+            Err(_) => unsafe {
+                libc::_exit(0);
+            },
         };
         // Python returns serialized ChildResponse bytes.
         let resp_bytes: Vec<u8> = Python::with_gil(|py| {
-            let main_mod = match py.import_bound("__main__") { Ok(m) => m, Err(_) => return fallback_child_err("__main__ missing") };
+            let main_mod = match py.import_bound("__main__") {
+                Ok(m) => m,
+                Err(_) => return fallback_child_err("__main__ missing"),
+            };
             let globals = main_mod.dict();
             let runner = match globals.get_item("_run_sandbox_pb") {
                 Ok(Some(r)) => r,
@@ -149,10 +185,14 @@ fn child_main(fd: RawFd) -> ! {
         // Quick peek: did helper set expire=true?
         let expire = match pb::ChildResponse::decode(&*resp_bytes) {
             Ok(r) => r.expire,
-            Err(_) => true,  // bad pb → defensively respawn
+            Err(_) => true, // bad pb → defensively respawn
         };
         let _ = send_frame_fd(fd, &resp_bytes);
-        if expire { unsafe { libc::_exit(0); } }
+        if expire {
+            unsafe {
+                libc::_exit(0);
+            }
+        }
     }
 }
 
@@ -176,9 +216,12 @@ fn fallback_child_err(msg: &str) -> Vec<u8> {
 // ---- pool entry + stats --------------------------------------------------
 
 struct IdleEntry {
-    pid: u32, fd: OwnedFd,
-    born_at: Instant, last_used: Instant,
-    requests_served: u64, last_rss_mb: u64,
+    pid: u32,
+    fd: OwnedFd,
+    born_at: Instant,
+    last_used: Instant,
+    requests_served: u64,
+    last_rss_mb: u64,
 }
 
 struct Stats {
@@ -203,40 +246,71 @@ impl Stats {
         }
     }
     fn bump_respawn(&self, reason: &str) {
-        *self.respawns_by_reason.lock().unwrap().entry(reason.to_string()).or_insert(0) += 1;
+        *self
+            .respawns_by_reason
+            .lock()
+            .unwrap()
+            .entry(reason.to_string())
+            .or_insert(0) += 1;
     }
 }
 
 type IdleQueue = Arc<Mutex<VecDeque<IdleEntry>>>;
 
-fn forker_thread(rx: mpsc::Receiver<()>, idle: IdleQueue, stats: Arc<Stats>, shutdown: Arc<AtomicBool>) {
+fn forker_thread(
+    rx: mpsc::Receiver<()>,
+    idle: IdleQueue,
+    stats: Arc<Stats>,
+    shutdown: Arc<AtomicBool>,
+) {
     while !shutdown.load(Ordering::Relaxed) {
-        let Ok(()) = rx.recv_timeout(Duration::from_secs(1)) else { continue; };
-        let (parent_sock, child_sock) = match socketpair(AddressFamily::Unix, SockType::Stream, None, SockFlag::empty()) {
+        let Ok(()) = rx.recv_timeout(Duration::from_secs(1)) else {
+            continue;
+        };
+        let (parent_sock, child_sock) = match socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        ) {
             Ok(p) => p,
-            Err(e) => { eprintln!("[forker] socketpair: {}", e); continue; }
+            Err(e) => {
+                eprintln!("[forker] socketpair: {}", e);
+                continue;
+            }
         };
         let child_fd_raw: RawFd = child_sock.as_raw_fd();
         let enqueue: Option<IdleEntry> = Python::with_gil(|_py| {
-            unsafe { pyo3::ffi::PyOS_BeforeFork(); }
+            unsafe {
+                pyo3::ffi::PyOS_BeforeFork();
+            }
             match unsafe { fork() } {
                 Ok(ForkResult::Child) => {
-                    unsafe { pyo3::ffi::PyOS_AfterFork_Child(); }
+                    unsafe {
+                        pyo3::ffi::PyOS_AfterFork_Child();
+                    }
                     drop(parent_sock);
                     child_main(child_fd_raw);
                 }
                 Ok(ForkResult::Parent { child }) => {
-                    unsafe { pyo3::ffi::PyOS_AfterFork_Parent(); }
+                    unsafe {
+                        pyo3::ffi::PyOS_AfterFork_Parent();
+                    }
                     drop(child_sock);
                     let now = Instant::now();
                     Some(IdleEntry {
-                        pid: child.as_raw() as u32, fd: parent_sock,
-                        born_at: now, last_used: now,
-                        requests_served: 0, last_rss_mb: 0,
+                        pid: child.as_raw() as u32,
+                        fd: parent_sock,
+                        born_at: now,
+                        last_used: now,
+                        requests_served: 0,
+                        last_rss_mb: 0,
                     })
                 }
                 Err(e) => {
-                    unsafe { pyo3::ffi::PyOS_AfterFork_Parent(); }
+                    unsafe {
+                        pyo3::ffi::PyOS_AfterFork_Parent();
+                    }
                     eprintln!("[forker] fork err: {}", e);
                     None
                 }
@@ -252,7 +326,9 @@ fn forker_thread(rx: mpsc::Receiver<()>, idle: IdleQueue, stats: Arc<Stats>, shu
 fn reaper_thread(state: Arc<AppState>) {
     loop {
         std::thread::sleep(state.reaper_interval);
-        if state.shutdown.load(Ordering::Relaxed) { return; }
+        if state.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
         let now = Instant::now();
         let mut to_drain: Vec<(&'static str, IdleEntry)> = Vec::new();
         {
@@ -277,17 +353,32 @@ fn reaper_thread(state: Arc<AppState>) {
                 let total: u64 = idle.iter().map(|e| e.last_rss_mb).sum();
                 let half_idle = idle.len() >= state.pool_size / 2;
                 if total > state.max_total_rss_mb && half_idle && !idle.is_empty() {
-                    let oldest_idx = idle.iter().enumerate()
-                        .min_by_key(|(_, e)| e.born_at).map(|(i, _)| i).unwrap_or(0);
+                    let oldest_idx = idle
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, e)| e.born_at)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
                     idle.remove(oldest_idx)
-                } else { None }
+                } else {
+                    None
+                }
             };
-            if let Some(entry) = victim { to_drain.push(("memory_pressure", entry)); }
+            if let Some(entry) = victim {
+                to_drain.push(("memory_pressure", entry));
+            }
         }
         for (reason, entry) in to_drain {
             match reason {
-                "age" => { state.stats.kills_reaper_age.fetch_add(1, Ordering::Relaxed); }
-                "idle_age" => { state.stats.kills_reaper_idle.fetch_add(1, Ordering::Relaxed); }
+                "age" => {
+                    state.stats.kills_reaper_age.fetch_add(1, Ordering::Relaxed);
+                }
+                "idle_age" => {
+                    state
+                        .stats
+                        .kills_reaper_idle
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 _ => {}
             }
             state.stats.bump_respawn(reason);
@@ -313,16 +404,28 @@ struct AppState {
     shutdown: Arc<AtomicBool>,
 }
 impl AppState {
-    fn trigger_refill(&self) { let _ = self.fork_tx.lock().unwrap().send(()); }
-    fn pop_idle(&self) -> Option<IdleEntry> { self.idle.lock().unwrap().pop_front() }
-    fn push_idle(&self, e: IdleEntry) { self.idle.lock().unwrap().push_back(e); }
-    fn idle_count(&self) -> usize { self.idle.lock().unwrap().len() }
+    fn trigger_refill(&self) {
+        let _ = self.fork_tx.lock().unwrap().send(());
+    }
+    fn pop_idle(&self) -> Option<IdleEntry> {
+        self.idle.lock().unwrap().pop_front()
+    }
+    fn push_idle(&self, e: IdleEntry) {
+        self.idle.lock().unwrap().push_back(e);
+    }
+    fn idle_count(&self) -> usize {
+        self.idle.lock().unwrap().len()
+    }
 }
 
 async fn acquire_child(state: &AppState, deadline: Instant) -> Option<IdleEntry> {
     loop {
-        if let Some(e) = state.pop_idle() { return Some(e); }
-        if Instant::now() >= deadline { return None; }
+        if let Some(e) = state.pop_idle() {
+            return Some(e);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
@@ -341,14 +444,19 @@ fn health_response_pb(state: &AppState) -> pb::HealthResp {
 
 fn stats_response_json(state: &AppState) -> String {
     let idle = state.idle.lock().unwrap();
-    let children: Vec<Value> = idle.iter().map(|e| json!({
-        "pid": e.pid,
-        "age_sec": e.born_at.elapsed().as_secs(),
-        "idle_sec": e.last_used.elapsed().as_secs(),
-        "requests_served": e.requests_served,
-        "last_rss_mb": e.last_rss_mb,
-        "state": "idle",
-    })).collect();
+    let children: Vec<Value> = idle
+        .iter()
+        .map(|e| {
+            json!({
+                "pid": e.pid,
+                "age_sec": e.born_at.elapsed().as_secs(),
+                "idle_sec": e.last_used.elapsed().as_secs(),
+                "requests_served": e.requests_served,
+                "last_rss_mb": e.last_rss_mb,
+                "state": "idle",
+            })
+        })
+        .collect();
     let idle_count = idle.len();
     drop(idle);
     let respawns = state.stats.respawns_by_reason.lock().unwrap().clone();
@@ -392,8 +500,12 @@ fn drain_response_json(state: &AppState, pid: Option<u32>, reason: Option<String
                 state.trigger_refill();
                 json!({"drained": target_pid, "method": "fd_close", "found": "idle"})
             } else {
-                unsafe { libc::kill(target_pid as i32, libc::SIGTERM); }
-                state.stats.bump_respawn(&format!("drain_active_{}", reason));
+                unsafe {
+                    libc::kill(target_pid as i32, libc::SIGTERM);
+                }
+                state
+                    .stats
+                    .bump_respawn(&format!("drain_active_{}", reason));
                 json!({"drained": target_pid, "method": "sigterm", "found": "active_or_dead"})
             }
         }
@@ -417,27 +529,67 @@ async fn exec_with_child(state: Arc<AppState>, job: pb::Job) -> pb::ExecResult {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut entry = match acquire_child(&state, deadline).await {
         Some(c) => c,
-        None => return pb::ExecResult {
-            stdout: String::new(), stderr: "no idle child".into(),
-            exit_code: 1, elapsed_ms: 0, output_files: ::std::collections::HashMap::new(), deleted_files: vec![], output_files_b64: Default::default() },
+        None => {
+            return pb::ExecResult {
+                stdout: String::new(),
+                stderr: "no idle child".into(),
+                exit_code: 1,
+                elapsed_ms: 0,
+                output_files: ::std::collections::HashMap::new(),
+                deleted_files: vec![],
+                output_files_b64: Default::default(),
+            }
+        }
     };
     let raw_fd = entry.fd.into_raw_fd();
     let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(raw_fd) };
     if std_stream.set_nonblocking(true).is_err() {
         state.trigger_refill();
-        return pb::ExecResult { stdout: String::new(), stderr: "nonblock fail".into(), exit_code: 1, elapsed_ms: 0, output_files: ::std::collections::HashMap::new(), deleted_files: vec![] , output_files_b64: Default::default()};
+        return pb::ExecResult {
+            stdout: String::new(),
+            stderr: "nonblock fail".into(),
+            exit_code: 1,
+            elapsed_ms: 0,
+            output_files: ::std::collections::HashMap::new(),
+            deleted_files: vec![],
+            output_files_b64: Default::default(),
+        };
     }
     let mut stream = match UnixStream::from_std(std_stream) {
         Ok(s) => s,
-        Err(_) => { state.trigger_refill(); return pb::ExecResult { stdout: String::new(), stderr: "from_std fail".into(), exit_code: 1, elapsed_ms: 0, output_files: ::std::collections::HashMap::new(), deleted_files: vec![] , output_files_b64: Default::default()}; }
+        Err(_) => {
+            state.trigger_refill();
+            return pb::ExecResult {
+                stdout: String::new(),
+                stderr: "from_std fail".into(),
+                exit_code: 1,
+                elapsed_ms: 0,
+                output_files: ::std::collections::HashMap::new(),
+                deleted_files: vec![],
+                output_files_b64: Default::default(),
+            };
+        }
     };
     let job_bytes = job.encode_to_vec();
     let n = (job_bytes.len() as u32).to_be_bytes();
     if stream.write_all(&n).await.is_err() || stream.write_all(&job_bytes).await.is_err() {
-        unsafe { libc::kill(entry.pid as i32, libc::SIGKILL); }
-        state.stats.kills_hard_timeout.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            libc::kill(entry.pid as i32, libc::SIGKILL);
+        }
+        state
+            .stats
+            .kills_hard_timeout
+            .fetch_add(1, Ordering::Relaxed);
         state.trigger_refill();
-        return pb::ExecResult { stdout: String::new(), stderr: "send fail".into(), exit_code: 1, elapsed_ms: 0, output_files: ::std::collections::HashMap::new(), deleted_files: vec![] , output_files_b64: Default::default()};
+        return pb::ExecResult {
+            stdout: String::new(),
+            stderr: "send fail".into(),
+            exit_code: 1,
+            elapsed_ms: 0,
+            output_files: ::std::collections::HashMap::new(),
+            deleted_files: vec![],
+            output_files_b64: Default::default(),
+        };
     }
 
     let recv_fut = async {
@@ -445,7 +597,10 @@ async fn exec_with_child(state: Arc<AppState>, job: pb::Job) -> pb::ExecResult {
         stream.read_exact(&mut hdr).await?;
         let n = u32::from_be_bytes(hdr) as usize;
         if n > MAX_FRAME {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame too large",
+            ));
         }
         let mut body = vec![0u8; n];
         stream.read_exact(&mut body).await?;
@@ -454,24 +609,63 @@ async fn exec_with_child(state: Arc<AppState>, job: pb::Job) -> pb::ExecResult {
     let body = match tokio::time::timeout(Duration::from_secs(timeout_s + 5), recv_fut).await {
         Ok(Ok(b)) => b,
         Ok(Err(_)) => {
-            unsafe { libc::kill(entry.pid as i32, libc::SIGKILL); }
-            state.stats.kills_hard_timeout.fetch_add(1, Ordering::Relaxed);
+            unsafe {
+                libc::kill(entry.pid as i32, libc::SIGKILL);
+            }
+            state
+                .stats
+                .kills_hard_timeout
+                .fetch_add(1, Ordering::Relaxed);
             state.stats.bump_respawn("child_died");
             state.trigger_refill();
-            return pb::ExecResult { stdout: String::new(), stderr: "child socket error".into(), exit_code: 1, elapsed_ms: 0, output_files: ::std::collections::HashMap::new(), deleted_files: vec![] , output_files_b64: Default::default()};
+            return pb::ExecResult {
+                stdout: String::new(),
+                stderr: "child socket error".into(),
+                exit_code: 1,
+                elapsed_ms: 0,
+                output_files: ::std::collections::HashMap::new(),
+                deleted_files: vec![],
+                output_files_b64: Default::default(),
+            };
         }
         Err(_) => {
-            unsafe { libc::kill(entry.pid as i32, libc::SIGKILL); }
-            state.stats.kills_hard_timeout.fetch_add(1, Ordering::Relaxed);
+            unsafe {
+                libc::kill(entry.pid as i32, libc::SIGKILL);
+            }
+            state
+                .stats
+                .kills_hard_timeout
+                .fetch_add(1, Ordering::Relaxed);
             state.stats.bump_respawn("hard_timeout");
             state.trigger_refill();
-            return pb::ExecResult { stdout: String::new(), stderr: "child hard timeout".into(), exit_code: 1, elapsed_ms: 0, output_files: ::std::collections::HashMap::new(), deleted_files: vec![] , output_files_b64: Default::default()};
+            return pb::ExecResult {
+                stdout: String::new(),
+                stderr: "child hard timeout".into(),
+                exit_code: 1,
+                elapsed_ms: 0,
+                output_files: ::std::collections::HashMap::new(),
+                deleted_files: vec![],
+                output_files_b64: Default::default(),
+            };
         }
     };
     let std_stream = match stream.into_std() {
         Ok(s) => s,
-        Err(_) => { unsafe { libc::kill(entry.pid as i32, libc::SIGKILL); } state.trigger_refill();
-            return pb::ExecResult { stdout: String::new(), stderr: "into_std fail".into(), exit_code: 1, elapsed_ms: 0, output_files: ::std::collections::HashMap::new(), deleted_files: vec![] , output_files_b64: Default::default()}; }
+        Err(_) => {
+            unsafe {
+                libc::kill(entry.pid as i32, libc::SIGKILL);
+            }
+            state.trigger_refill();
+            return pb::ExecResult {
+                stdout: String::new(),
+                stderr: "into_std fail".into(),
+                exit_code: 1,
+                elapsed_ms: 0,
+                output_files: ::std::collections::HashMap::new(),
+                deleted_files: vec![],
+                output_files_b64: Default::default(),
+            };
+        }
     };
     let _ = std_stream.set_nonblocking(false);
     entry.fd = unsafe { OwnedFd::from_raw_fd(std_stream.into_raw_fd()) };
@@ -480,17 +674,31 @@ async fn exec_with_child(state: Arc<AppState>, job: pb::Job) -> pb::ExecResult {
         Ok(r) => r,
         Err(_) => {
             drop(entry.fd);
-            unsafe { libc::kill(entry.pid as i32, libc::SIGKILL); }
+            unsafe {
+                libc::kill(entry.pid as i32, libc::SIGKILL);
+            }
             state.stats.bump_respawn("bad_pb");
             state.trigger_refill();
-            return pb::ExecResult { stdout: String::new(), stderr: "child returned invalid pb".into(), exit_code: 1, elapsed_ms: 0, output_files: ::std::collections::HashMap::new(), deleted_files: vec![] , output_files_b64: Default::default()};
+            return pb::ExecResult {
+                stdout: String::new(),
+                stderr: "child returned invalid pb".into(),
+                exit_code: 1,
+                elapsed_ms: 0,
+                output_files: ::std::collections::HashMap::new(),
+                deleted_files: vec![],
+                output_files_b64: Default::default(),
+            };
         }
     };
 
     state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
     let lc = child_resp.lifecycle.unwrap_or_default();
     if child_resp.expire {
-        let reason = if lc.expire_reason.is_empty() { "unknown".to_string() } else { lc.expire_reason };
+        let reason = if lc.expire_reason.is_empty() {
+            "unknown".to_string()
+        } else {
+            lc.expire_reason
+        };
         state.stats.bump_respawn(&reason);
         drop(entry.fd);
         state.trigger_refill();
@@ -507,10 +715,9 @@ async fn exec_with_child(state: Arc<AppState>, job: pb::Job) -> pb::ExecResult {
         elapsed_ms: start.elapsed().as_millis() as u64,
         output_files: child_resp.output_files,
         deleted_files: child_resp.deleted_files,
-output_files_b64: child_resp.output_files_b64,
+        output_files_b64: child_resp.output_files_b64,
     }
 }
-
 
 fn send_with_fds(stream_fd: RawFd, payload: &[u8], fds: &[RawFd]) -> std::io::Result<()> {
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
@@ -539,7 +746,11 @@ async fn handle_connection(state: Arc<AppState>, mut stream: UnixStream) {
         let request: pb::Request = match pb::Request::decode(&*frame) {
             Ok(r) => r,
             Err(e) => {
-                let resp = pb::Response { kind: "error".into(), error: format!("bad pb: {}", e), ..Default::default() };
+                let resp = pb::Response {
+                    kind: "error".into(),
+                    error: format!("bad pb: {}", e),
+                    ..Default::default()
+                };
                 let _ = send_frame_async(&mut stream, &resp.encode_to_vec()).await;
                 continue;
             }
@@ -560,10 +771,15 @@ async fn handle_connection(state: Arc<AppState>, mut stream: UnixStream) {
                 }
             }
             // Trigger refill BEFORE we hand fds out so forker has head start.
-            for _ in 0..acquired.len() { state.trigger_refill(); }
+            for _ in 0..acquired.len() {
+                state.trigger_refill();
+            }
 
             let fds: Vec<RawFd> = acquired.iter().map(|e| e.fd.as_raw_fd()).collect();
-            let resp = pb::Response { kind: request.cmd.clone(), ..Default::default() };
+            let resp = pb::Response {
+                kind: request.cmd.clone(),
+                ..Default::default()
+            };
             let resp_bytes = resp.encode_to_vec();
             let raw_fd = stream.as_raw_fd();
             if let Err(e) = send_with_fds(raw_fd, &resp_bytes, &fds) {
@@ -577,19 +793,38 @@ async fn handle_connection(state: Arc<AppState>, mut stream: UnixStream) {
         }
 
         let resp: pb::Response = match request.cmd.as_str() {
-            "health" => pb::Response { kind: "health".into(), health: Some(health_response_pb(&state)), ..Default::default() },
-            "stats" => pb::Response { kind: "stats".into(), json: stats_response_json(&state), ..Default::default() },
+            "health" => pb::Response {
+                kind: "health".into(),
+                health: Some(health_response_pb(&state)),
+                ..Default::default()
+            },
+            "stats" => pb::Response {
+                kind: "stats".into(),
+                json: stats_response_json(&state),
+                ..Default::default()
+            },
             "drain" => {
                 let d = request.drain.unwrap_or_default();
-                pb::Response { kind: "drain".into(), json: drain_response_json(&state, d.pid, Some(d.reason)), ..Default::default() }
+                pb::Response {
+                    kind: "drain".into(),
+                    json: drain_response_json(&state, d.pid, Some(d.reason)),
+                    ..Default::default()
+                }
             }
             _ => {
                 let job = request.job.unwrap_or_default();
                 let exec = exec_with_child(state.clone(), job).await;
-                pb::Response { kind: "exec".into(), exec: Some(exec), ..Default::default() }
+                pb::Response {
+                    kind: "exec".into(),
+                    exec: Some(exec),
+                    ..Default::default()
+                }
             }
         };
-        if send_frame_async(&mut stream, &resp.encode_to_vec()).await.is_err() {
+        if send_frame_async(&mut stream, &resp.encode_to_vec())
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -599,9 +834,15 @@ async fn handle_connection(state: Arc<AppState>, mut stream: UnixStream) {
 
 fn main() -> Result<()> {
     let cfg = Config::from_env();
-    eprintln!("[parent] booting socket={} pool_size={} prewarm={:?}",
-        cfg.socket_path.display(), cfg.pool_size, cfg.prewarm);
-    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN); }
+    eprintln!(
+        "[parent] booting socket={} pool_size={} prewarm={:?}",
+        cfg.socket_path.display(),
+        cfg.pool_size,
+        cfg.prewarm
+    );
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+    }
 
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| -> PyResult<()> {
@@ -611,7 +852,11 @@ fn main() -> Result<()> {
         for name in &cfg.prewarm {
             let t = Instant::now();
             match py.import_bound(name.as_str()) {
-                Ok(_) => eprintln!("[parent] prewarm ok: {} ({:.0}ms)", name, t.elapsed().as_secs_f64()*1000.0),
+                Ok(_) => eprintln!(
+                    "[parent] prewarm ok: {} ({:.0}ms)",
+                    name,
+                    t.elapsed().as_secs_f64() * 1000.0
+                ),
                 Err(e) => eprintln!("[parent] prewarm FAIL {}: {}", name, e),
             }
         }
@@ -630,11 +875,15 @@ fn main() -> Result<()> {
         let idle_c = idle.clone();
         let stats_c = stats.clone();
         let shutdown_c = shutdown.clone();
-        std::thread::Builder::new().name("forker".into()).spawn(move || {
-            forker_thread(fork_rx, idle_c, stats_c, shutdown_c);
-        })?;
+        std::thread::Builder::new()
+            .name("forker".into())
+            .spawn(move || {
+                forker_thread(fork_rx, idle_c, stats_c, shutdown_c);
+            })?;
     }
-    for _ in 0..cfg.pool_size { let _ = fork_tx.send(()); }
+    for _ in 0..cfg.pool_size {
+        let _ = fork_tx.send(());
+    }
     let want_initial = cfg.pool_size.min(4);
     let deadline = Instant::now() + Duration::from_secs(30);
     while idle.lock().unwrap().len() < want_initial && Instant::now() < deadline {
@@ -643,18 +892,28 @@ fn main() -> Result<()> {
     eprintln!("[parent] initial idle={}", idle.lock().unwrap().len());
 
     let state = Arc::new(AppState {
-        idle, fork_tx: Mutex::new(fork_tx),
-        pool_size: cfg.pool_size, max_timeout: cfg.max_timeout, prewarm: cfg.prewarm,
-        stats, max_age: cfg.max_age, max_idle: cfg.max_idle,
-        reaper_interval: cfg.reaper_interval, max_total_rss_mb: cfg.max_total_rss_mb,
+        idle,
+        fork_tx: Mutex::new(fork_tx),
+        pool_size: cfg.pool_size,
+        max_timeout: cfg.max_timeout,
+        prewarm: cfg.prewarm,
+        stats,
+        max_age: cfg.max_age,
+        max_idle: cfg.max_idle,
+        reaper_interval: cfg.reaper_interval,
+        max_total_rss_mb: cfg.max_total_rss_mb,
         shutdown: shutdown.clone(),
     });
     {
         let state_c = state.clone();
-        std::thread::Builder::new().name("reaper".into()).spawn(move || reaper_thread(state_c))?;
+        std::thread::Builder::new()
+            .name("reaper".into())
+            .spawn(move || reaper_thread(state_c))?;
     }
 
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         if let Some(parent) = cfg.socket_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -729,7 +988,8 @@ mod tests {
         let job = pb::Job {
             code: "print(2+2)".into(),
             timeout: 30,
-            env, files,
+            env,
+            files,
             persist_changes: true,
             persist_root_label: "label".into(),
         };

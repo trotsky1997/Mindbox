@@ -1,7 +1,4 @@
 fn main() -> std::io::Result<()> {
-    prost_build::compile_protos(
-        &["../proto/inspect.proto"],
-        &["../proto"],
-    )?;
+    prost_build::compile_protos(&["../proto/inspect.proto"], &["../proto"])?;
     Ok(())
 }

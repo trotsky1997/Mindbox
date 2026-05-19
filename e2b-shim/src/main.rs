@@ -75,10 +75,18 @@ struct SandboxRec {
     state: String,
 }
 
-fn default_cpu() -> u32 { 2 }
-fn default_mem() -> u32 { 1024 }
-fn default_disk() -> u32 { 4096 }
-fn default_state() -> String { "running".into() }
+fn default_cpu() -> u32 {
+    2
+}
+fn default_mem() -> u32 {
+    1024
+}
+fn default_disk() -> u32 {
+    4096
+}
+fn default_state() -> String {
+    "running".into()
+}
 
 const SANDBOX_FS_ROOT: &str = "/var/lib/e2b-shim/sandboxes";
 const SANDBOX_REGISTRY_DIR: &str = "/var/lib/e2b-shim/registry";
@@ -100,10 +108,14 @@ fn forget_sandbox(sid: &str) {
 
 fn load_registry() -> Vec<SandboxRec> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(SANDBOX_REGISTRY_DIR) else { return out; };
+    let Ok(rd) = std::fs::read_dir(SANDBOX_REGISTRY_DIR) else {
+        return out;
+    };
     for entry in rd.flatten() {
         let p = entry.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
+        if p.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
         if let Ok(bytes) = std::fs::read(&p) {
             if let Ok(rec) = serde_json::from_slice::<SandboxRec>(&bytes) {
                 out.push(rec);
@@ -112,8 +124,6 @@ fn load_registry() -> Vec<SandboxRec> {
     }
     out
 }
-
-
 
 fn sandbox_fs_dir(sid: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(SANDBOX_FS_ROOT).join(sid)
@@ -127,11 +137,19 @@ fn ensure_sandbox_fs(sid: &str) -> std::io::Result<std::path::PathBuf> {
 
 fn collect_files(root: &std::path::Path) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut std::collections::HashMap<String, String>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return; };
+    fn walk(
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut std::collections::HashMap<String, String>,
+    ) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in rd.flatten() {
             let p = entry.path();
-            let Ok(meta) = entry.metadata() else { continue; };
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
             if meta.is_dir() {
                 walk(base, &p, out);
             } else if meta.is_file() {
@@ -155,27 +173,37 @@ struct AppState {
     tos: Option<Arc<TosConfig>>,
     template_builds: DashMap<String, Arc<TemplateBuild>>,
     template_id_to_build: DashMap<String, String>,
-    template_tags: DashMap<String, Vec<String>>,   // template_name -> tags
-    volumes: DashMap<String, VolumeRec>,            // volume_id -> rec
-    snapshots: DashMap<String, SnapshotRec>,        // snapshot_id -> rec
+    template_tags: DashMap<String, Vec<String>>, // template_name -> tags
+    volumes: DashMap<String, VolumeRec>,         // volume_id -> rec
+    snapshots: DashMap<String, SnapshotRec>,     // snapshot_id -> rec
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VolumeRec {
-    #[serde(rename = "volumeID")] volume_id: String,
+    #[serde(rename = "volumeID")]
+    volume_id: String,
     name: String,
-    #[serde(rename = "sizeMB", default = "default_vol_size")] size_mb: u32,
-    #[serde(rename = "createdAt")] created_at: String,
+    #[serde(rename = "sizeMB", default = "default_vol_size")]
+    size_mb: u32,
+    #[serde(rename = "createdAt")]
+    created_at: String,
 }
-fn default_vol_size() -> u32 { 1024 }
+fn default_vol_size() -> u32 {
+    1024
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotRec {
-    #[serde(rename = "snapshotID")] snapshot_id: String,
-    #[serde(rename = "sandboxID")] sandbox_id: String,
-    #[serde(rename = "templateID")] template_id: String,
-    #[serde(rename = "tosURL")] tos_url: String,
-    #[serde(rename = "createdAt")] created_at: String,
+    #[serde(rename = "snapshotID")]
+    snapshot_id: String,
+    #[serde(rename = "sandboxID")]
+    sandbox_id: String,
+    #[serde(rename = "templateID")]
+    template_id: String,
+    #[serde(rename = "tosURL")]
+    tos_url: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
 }
 
 #[derive(Debug)]
@@ -205,16 +233,30 @@ struct TosConfig {
 
 fn tos_from_env() -> Option<TosConfig> {
     let bucket_name = std::env::var("TOS_BUCKET").ok().filter(|s| !s.is_empty())?;
-    let endpoint = std::env::var("TOS_S3_ENDPOINT").ok().filter(|s| !s.is_empty())?;
+    let endpoint = std::env::var("TOS_S3_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())?;
     let region = std::env::var("TOS_REGION").unwrap_or_else(|_| "cn-beijing".into());
-    let ak = std::env::var("TOS_ACCESS_KEY").ok().filter(|s| !s.is_empty())?;
-    let sk = std::env::var("TOS_SECRET_KEY").ok().filter(|s| !s.is_empty())?;
+    let ak = std::env::var("TOS_ACCESS_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let sk = std::env::var("TOS_SECRET_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())?;
     let creds = s3::creds::Credentials::new(Some(&ak), Some(&sk), None, None, None).ok()?;
-    let r = s3::Region::Custom { region: region.clone(), endpoint: endpoint.clone() };
+    let r = s3::Region::Custom {
+        region: region.clone(),
+        endpoint: endpoint.clone(),
+    };
     // Volcano TOS rejects path-style; must use virtual-hosted addressing
     // (bucket name in hostname). rust-s3 defaults to virtual-hosted.
     let bucket = s3::Bucket::new(&bucket_name, r, creds).ok()?;
-    Some(TosConfig { bucket, bucket_name, region, endpoint })
+    Some(TosConfig {
+        bucket,
+        bucket_name,
+        region,
+        endpoint,
+    })
 }
 
 // ---- REST: POST /sandboxes ---------------------------------------------
@@ -234,14 +276,29 @@ struct NewSandbox {
     env_vars: Option<serde_json::Value>,
 }
 
-async fn check_api_key(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
-    if state.api_key.is_none() { return Ok(()); }
+async fn check_api_key(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, String)> {
+    if state.api_key.is_none() {
+        return Ok(());
+    }
     let want = state.api_key.as_deref().unwrap();
-    let got = headers.get("x-api-key").and_then(|h| h.to_str().ok())
-        .or_else(|| headers.get("authorization").and_then(|h| h.to_str().ok()).and_then(|s| s.strip_prefix("Bearer ")));
+    let got = headers
+        .get("x-api-key")
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("authorization")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+        });
     match got {
         Some(t) if t == want => Ok(()),
-        _ => Err((StatusCode::UNAUTHORIZED, r#"{"code":"unauthenticated","message":"invalid X-API-KEY"}"#.into())),
+        _ => Err((
+            StatusCode::UNAUTHORIZED,
+            r#"{"code":"unauthenticated","message":"invalid X-API-KEY"}"#.into(),
+        )),
     }
 }
 
@@ -252,31 +309,58 @@ async fn create_sandbox(
 ) -> Result<(StatusCode, Json<SandboxRec>), (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
 
-    let template_id = if body.template_id.is_empty() { "default".to_string() } else { body.template_id.clone() };
+    let template_id = if body.template_id.is_empty() {
+        "default".to_string()
+    } else {
+        body.template_id.clone()
+    };
     // Verify template exists upstream.
     let url = format!("{}/templates", state.upstream);
-    let resp = state.http.get(&url).send().await
+    let resp = state
+        .http
+        .get(&url)
+        .send()
+        .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream: {}", e)))?;
-    let v: serde_json::Value = resp.json().await
+    let v: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream json: {}", e)))?;
-    let templates = v.get("templates").and_then(|t| t.as_array()).cloned().unwrap_or_default();
-    let known: Vec<String> = templates.iter()
+    let templates = v
+        .get("templates")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let known: Vec<String> = templates
+        .iter()
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
         .collect();
     if !known.contains(&template_id) {
-        return Err((StatusCode::NOT_FOUND,
-            format!(r#"{{"code":"not_found","message":"template '{}' not found; available: {:?}"}}"#,
-                template_id, known)));
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                r#"{{"code":"not_found","message":"template '{}' not found; available: {:?}"}}"#,
+                template_id, known
+            ),
+        ));
     }
 
-    let sid = format!("i{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..20].to_string());
+    let sid = format!(
+        "i{}",
+        uuid::Uuid::new_v4().to_string().replace('-', "")[..20].to_string()
+    );
     let now = Utc::now();
     let end = now + chrono::Duration::seconds(body.timeout.unwrap_or(900) as i64);
     let rec = SandboxRec {
         sandbox_id: sid.clone(),
         template_id: template_id.clone(),
         client_id: "shim".to_string(),
-        domain: Some(state.upstream.replace("http://", "").replace("https://", "")),
+        domain: Some(
+            state
+                .upstream
+                .replace("http://", "")
+                .replace("https://", ""),
+        ),
         envd_version: "0.5.0".to_string(),
         envd_access_token: Some(uuid::Uuid::new_v4().to_string()),
         alias: body.alias,
@@ -302,8 +386,13 @@ async fn get_sandbox(
     headers: HeaderMap,
 ) -> Result<Json<SandboxRec>, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let rec = state.sandboxes.get(&sid)
-        .ok_or((StatusCode::NOT_FOUND, format!(r#"{{"code":"not_found","message":"sandbox {} not found"}}"#, sid)))?;
+    let rec = state.sandboxes.get(&sid).ok_or((
+        StatusCode::NOT_FOUND,
+        format!(
+            r#"{{"code":"not_found","message":"sandbox {} not found"}}"#,
+            sid
+        ),
+    ))?;
     Ok(Json(rec.clone()))
 }
 
@@ -319,9 +408,10 @@ async fn delete_sandbox(
     Ok(StatusCode::NO_CONTENT)
 }
 
-
 #[derive(serde::Deserialize)]
-struct SetTimeoutBody { timeout: i64 }
+struct SetTimeoutBody {
+    timeout: i64,
+}
 
 async fn set_sandbox_timeout(
     State(state): State<Arc<AppState>>,
@@ -330,8 +420,16 @@ async fn set_sandbox_timeout(
     Json(body): Json<SetTimeoutBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let mut rec = state.sandboxes.get(&sid)
-        .ok_or((StatusCode::NOT_FOUND, format!(r#"{{"code":"not_found","message":"sandbox {} not found"}}"#, sid)))?
+    let mut rec = state
+        .sandboxes
+        .get(&sid)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!(
+                r#"{{"code":"not_found","message":"sandbox {} not found"}}"#,
+                sid
+            ),
+        ))?
         .clone();
     let new_end = chrono::Utc::now() + chrono::Duration::seconds(body.timeout.max(1));
     rec.end_at = new_end.to_rfc3339();
@@ -367,7 +465,6 @@ fn end_envelope_err(code: &str, msg: &str) -> Bytes {
     envelope(0x02, body.as_bytes())
 }
 
-
 fn enc_resp(r: &pb::StartResponse, codec: Codec) -> Bytes {
     match codec {
         Codec::Proto => data_envelope_proto(r),
@@ -379,25 +476,29 @@ fn enc_resp(r: &pb::StartResponse, codec: Codec) -> Bytes {
 /// Mirrors the oneof flattening: ProcessEvent.event oneof appears as a sibling field.
 fn response_to_json(r: &pb::StartResponse) -> serde_json::Value {
     use serde_json::json;
-    let event_json = r.event.as_ref().and_then(|e| e.event.as_ref()).map(|ev| match ev {
-        ProcessEventOneof::Start(s) => json!({"start": {"pid": s.pid}}),
-        ProcessEventOneof::Data(d) => {
-            let inner = match &d.output {
-                Some(data_event::Output::Stdout(b)) => json!({"stdout": general_b64(b)}),
-                Some(data_event::Output::Stderr(b)) => json!({"stderr": general_b64(b)}),
-                Some(data_event::Output::Pty(b))    => json!({"pty":    general_b64(b)}),
-                None => json!({}),
-            };
-            json!({"data": inner})
-        }
-        ProcessEventOneof::End(e) => json!({"end": {
-            "exitCode": e.exit_code,
-            "exited": e.exited,
-            "status": e.status,
-            "error": e.error,
-        }}),
-        ProcessEventOneof::Keepalive(_) => json!({"keepalive": {}}),
-    });
+    let event_json = r
+        .event
+        .as_ref()
+        .and_then(|e| e.event.as_ref())
+        .map(|ev| match ev {
+            ProcessEventOneof::Start(s) => json!({"start": {"pid": s.pid}}),
+            ProcessEventOneof::Data(d) => {
+                let inner = match &d.output {
+                    Some(data_event::Output::Stdout(b)) => json!({"stdout": general_b64(b)}),
+                    Some(data_event::Output::Stderr(b)) => json!({"stderr": general_b64(b)}),
+                    Some(data_event::Output::Pty(b)) => json!({"pty":    general_b64(b)}),
+                    None => json!({}),
+                };
+                json!({"data": inner})
+            }
+            ProcessEventOneof::End(e) => json!({"end": {
+                "exitCode": e.exit_code,
+                "exited": e.exited,
+                "status": e.status,
+                "error": e.error,
+            }}),
+            ProcessEventOneof::Keepalive(_) => json!({"keepalive": {}}),
+        });
     json!({ "event": event_json })
 }
 
@@ -407,43 +508,60 @@ fn general_b64(b: &[u8]) -> String {
     let mut out = String::with_capacity((b.len() + 2) / 3 * 4);
     let mut i = 0;
     while i + 3 <= b.len() {
-        let n = ((b[i] as u32) << 16) | ((b[i+1] as u32) << 8) | (b[i+2] as u32);
+        let n = ((b[i] as u32) << 16) | ((b[i + 1] as u32) << 8) | (b[i + 2] as u32);
         out.push(A[((n >> 18) & 63) as usize] as char);
         out.push(A[((n >> 12) & 63) as usize] as char);
-        out.push(A[((n >>  6) & 63) as usize] as char);
+        out.push(A[((n >> 6) & 63) as usize] as char);
         out.push(A[(n & 63) as usize] as char);
         i += 3;
     }
     if i < b.len() {
         let rem = b.len() - i;
         let mut n = (b[i] as u32) << 16;
-        if rem == 2 { n |= (b[i+1] as u32) << 8; }
+        if rem == 2 {
+            n |= (b[i + 1] as u32) << 8;
+        }
         out.push(A[((n >> 18) & 63) as usize] as char);
         out.push(A[((n >> 12) & 63) as usize] as char);
-        if rem == 2 { out.push(A[((n >> 6) & 63) as usize] as char); } else { out.push('='); }
+        if rem == 2 {
+            out.push(A[((n >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
         out.push('=');
     }
     out
 }
 
-
-
 // ---- /process.Process/Start ---------------------------------------------
 
 #[derive(Clone, Copy)]
-enum Codec { Proto, Json }
-
-fn codec_from_content_type(ct: &str) -> Codec {
-    if ct.contains("json") { Codec::Json } else { Codec::Proto }
+enum Codec {
+    Proto,
+    Json,
 }
 
-fn is_stream_ct(ct: &str) -> bool { ct.starts_with("application/connect+") }
+fn codec_from_content_type(ct: &str) -> Codec {
+    if ct.contains("json") {
+        Codec::Json
+    } else {
+        Codec::Proto
+    }
+}
+
+fn is_stream_ct(ct: &str) -> bool {
+    ct.starts_with("application/connect+")
+}
 
 fn extract_body<'a>(ct: &str, body: &'a [u8]) -> Option<&'a [u8]> {
     if is_stream_ct(ct) {
-        if body.len() < 5 { return None; }
+        if body.len() < 5 {
+            return None;
+        }
         let len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-        if body.len() < 5 + len { return None; }
+        if body.len() < 5 + len {
+            return None;
+        }
         Some(&body[5..5 + len])
     } else {
         Some(body)
@@ -494,7 +612,11 @@ fn decode_start_request(ct: &str, body: &[u8]) -> Option<pb::StartRequest> {
     }
 }
 
-fn build_python_subprocess(args_combined: Vec<String>, envs: std::collections::HashMap<String, String>, cwd: Option<String>) -> String {
+fn build_python_subprocess(
+    args_combined: Vec<String>,
+    envs: std::collections::HashMap<String, String>,
+    cwd: Option<String>,
+) -> String {
     // Convert the E2B ProcessConfig into Python code that subprocess.runs it.
     // We use json to safely embed the args/env into the Python source.
     let args_json = serde_json::to_string(&args_combined).unwrap_or("[]".into());
@@ -542,11 +664,17 @@ async fn process_start(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let content_type = headers.get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok()).unwrap_or("application/connect+proto");
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/connect+proto");
 
     let codec = codec_from_content_type(content_type);
-    eprintln!("[shim] start: ct={:?} body_len={}", content_type, body.len());
+    eprintln!(
+        "[shim] start: ct={:?} body_len={}",
+        content_type,
+        body.len()
+    );
     let req: pb::StartRequest = match decode_start_request(content_type, &body) {
         Some(r) => r,
         None => {
@@ -554,7 +682,10 @@ async fn process_start(
             return (StatusCode::BAD_REQUEST, "decode failed").into_response();
         }
     };
-    eprintln!("[shim] start: decoded process={:?}", req.process.as_ref().map(|p| (&p.cmd, &p.args)));
+    eprintln!(
+        "[shim] start: decoded process={:?}",
+        req.process.as_ref().map(|p| (&p.cmd, &p.args))
+    );
 
     let proc_cfg = req.process.unwrap_or_default();
     // Figure out which template to dispatch to. For Phase 1 MVP we use the env var
@@ -574,8 +705,10 @@ async fn process_start(
     if let Some(s_ref) = sid.as_ref() {
         if let Some(rec) = state.sandboxes.get(s_ref) {
             if rec.state == "paused" {
-                return (StatusCode::CONFLICT,
-                    r#"{"code":"conflict","message":"sandbox is paused; call resume() first"}"#)
+                return (
+                    StatusCode::CONFLICT,
+                    r#"{"code":"conflict","message":"sandbox is paused; call resume() first"}"#,
+                )
                     .into_response();
             }
         }
@@ -595,7 +728,7 @@ async fn process_start(
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
 
     // Send StartEvent (fake pid).
-let encode_resp = move |r: &pb::StartResponse| enc_resp(r, codec);
+    let encode_resp = move |r: &pb::StartResponse| enc_resp(r, codec);
     let start_evt = pb::StartResponse {
         event: Some(pb::ProcessEvent {
             event: Some(ProcessEventOneof::Start(StartEvent { pid: 1 })),
@@ -620,7 +753,8 @@ let encode_resp = move |r: &pb::StartResponse| enc_resp(r, codec);
             "files": sandbox_files,
             "persist_changes": true,
         });
-        let resp = http.post(format!("{}/exec_hot", upstream))
+        let resp = http
+            .post(format!("{}/exec_hot", upstream))
             .json(&body)
             .timeout(Duration::from_secs(120))
             .send()
@@ -658,7 +792,9 @@ let encode_resp = move |r: &pb::StartResponse| enc_resp(r, codec);
                             let evt = pb::StartResponse {
                                 event: Some(pb::ProcessEvent {
                                     event: Some(ProcessEventOneof::Data(DataEvent {
-                                        output: Some(data_event::Output::Stdout(u.stdout.into_bytes())),
+                                        output: Some(data_event::Output::Stdout(
+                                            u.stdout.into_bytes(),
+                                        )),
                                     })),
                                 }),
                             };
@@ -668,7 +804,9 @@ let encode_resp = move |r: &pb::StartResponse| enc_resp(r, codec);
                             let evt = pb::StartResponse {
                                 event: Some(pb::ProcessEvent {
                                     event: Some(ProcessEventOneof::Data(DataEvent {
-                                        output: Some(data_event::Output::Stderr(u.stderr.into_bytes())),
+                                        output: Some(data_event::Output::Stderr(
+                                            u.stderr.into_bytes(),
+                                        )),
                                     })),
                                 }),
                             };
@@ -688,21 +826,32 @@ let encode_resp = move |r: &pb::StartResponse| enc_resp(r, codec);
                         let _ = tx2.send(Ok(end_envelope_ok())).await;
                     }
                     Err(e) => {
-                        let _ = tx2.send(Ok(end_envelope_err("internal",
-                            &format!("upstream json: {}", e)))).await;
+                        let _ = tx2
+                            .send(Ok(end_envelope_err(
+                                "internal",
+                                &format!("upstream json: {}", e),
+                            )))
+                            .await;
                     }
                 }
             }
             Err(e) => {
-                let _ = tx2.send(Ok(end_envelope_err("unavailable",
-                    &format!("upstream send: {}", e)))).await;
+                let _ = tx2
+                    .send(Ok(end_envelope_err(
+                        "unavailable",
+                        &format!("upstream send: {}", e),
+                    )))
+                    .await;
             }
         }
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = Body::from_stream(stream);
-    let ct_out = match codec { Codec::Proto => "application/connect+proto", Codec::Json => "application/connect+json" };
+    let ct_out = match codec {
+        Codec::Proto => "application/connect+proto",
+        Codec::Json => "application/connect+json",
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ct_out)
@@ -711,12 +860,25 @@ let encode_resp = move |r: &pb::StartResponse| enc_resp(r, codec);
         .unwrap()
 }
 
-async fn process_list(State(_state): State<Arc<AppState>>, headers: HeaderMap, _body: Bytes) -> Response {
-    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/proto");
+async fn process_list(
+    State(_state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    _body: Bytes,
+) -> Response {
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/proto");
     let codec = codec_from_content_type(ct);
     let (body, out_ct) = match codec {
-        Codec::Json => (serde_json::to_vec(&serde_json::json!({"processes": []})).unwrap(), "application/json"),
-        Codec::Proto => (pb::ListResponse { processes: vec![] }.encode_to_vec(), "application/proto"),
+        Codec::Json => (
+            serde_json::to_vec(&serde_json::json!({"processes": []})).unwrap(),
+            "application/json",
+        ),
+        Codec::Proto => (
+            pb::ListResponse { processes: vec![] }.encode_to_vec(),
+            "application/proto",
+        ),
     };
     Response::builder()
         .status(StatusCode::OK)
@@ -739,31 +901,46 @@ async fn shim_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }))
 }
 
-
 // ---- Filesystem service (Connect unary) --------------------------------
 // Sandbox ID for the request comes from X-Sandbox-Id header. If absent, we
 // fall back to E2B_SHIM_DEFAULT_SANDBOX or reject.
 
 fn pick_sandbox_id(state: &AppState, headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
-    if let Some(h) = headers.get("e2b-sandbox-id").or_else(|| headers.get("x-sandbox-id")).and_then(|v| v.to_str().ok()) {
+    if let Some(h) = headers
+        .get("e2b-sandbox-id")
+        .or_else(|| headers.get("x-sandbox-id"))
+        .and_then(|v| v.to_str().ok())
+    {
         return Ok(h.to_string());
     }
     // Many clients (Sandbox(template).files.write) don't pass sandbox ID — there's
     // only ever ONE sandbox per Sandbox instance, and the SDK ties it via subdomain.
     // For the single-sandbox case we accept the most recently created.
     if !state.sandboxes.is_empty() {
-        let latest = state.sandboxes.iter()
+        let latest = state
+            .sandboxes
+            .iter()
             .max_by(|a, b| a.value().started_at.cmp(&b.value().started_at))
             .map(|e| e.key().clone());
-        if let Some(s) = latest { return Ok(s); }
+        if let Some(s) = latest {
+            return Ok(s);
+        }
     }
     if let Ok(sid) = std::env::var("E2B_SHIM_DEFAULT_SANDBOX") {
         return Ok(sid);
     }
-    Err((StatusCode::BAD_REQUEST, r#"{"code":"invalid_argument","message":"no X-Sandbox-Id header and multiple sandboxes"}"#.into()))
+    Err((
+        StatusCode::BAD_REQUEST,
+        r#"{"code":"invalid_argument","message":"no X-Sandbox-Id header and multiple sandboxes"}"#
+            .into(),
+    ))
 }
 
-fn resolve_path(state: &AppState, headers: &HeaderMap, p: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+fn resolve_path(
+    state: &AppState,
+    headers: &HeaderMap,
+    p: &str,
+) -> Result<std::path::PathBuf, (StatusCode, String)> {
     let sid = pick_sandbox_id(state, headers)?;
     let root = sandbox_fs_dir(&sid);
     let _ = std::fs::create_dir_all(&root);
@@ -798,10 +975,11 @@ fn decode_unary_path_request(ct: &str, body: &[u8]) -> Option<JsonPathRequest> {
             let mut req = JsonPathRequest::default();
             let mut buf = payload;
             while !buf.is_empty() {
-                let (tag, rest) = match prost::encoding::decode_varint(&mut std::io::Cursor::new(buf)) {
-                    Ok(v) => (v, buf),
-                    Err(_) => return None,
-                };
+                let (tag, rest) =
+                    match prost::encoding::decode_varint(&mut std::io::Cursor::new(buf)) {
+                        Ok(v) => (v, buf),
+                        Err(_) => return None,
+                    };
                 let _ = (tag, rest);
                 // Too tedious to hand-decode; fallback: return Some empty so callers don't crash.
                 break;
@@ -817,9 +995,13 @@ fn make_entry_info_json(path: &std::path::Path, root: &std::path::Path) -> serde
     let (size, mode, ftype) = match &meta {
         Some(m) => {
             use std::os::unix::fs::PermissionsExt;
-            let ft = if m.is_dir() { 2 }
-                     else if m.is_file() { 1 }
-                     else { 0 };
+            let ft = if m.is_dir() {
+                2
+            } else if m.is_file() {
+                1
+            } else {
+                0
+            };
             (m.len() as i64, m.permissions().mode() as u32, ft)
         }
         None => (0i64, 0u32, 0),
@@ -849,7 +1031,10 @@ fn unary_json_response(ct: &str, value: serde_json::Value) -> Response {
             value.to_string().into_bytes()
         }
     };
-    let ct_out = match codec { Codec::Proto => "application/proto", Codec::Json => "application/json" };
+    let ct_out = match codec {
+        Codec::Proto => "application/proto",
+        Codec::Json => "application/json",
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ct_out)
@@ -859,7 +1044,10 @@ fn unary_json_response(ct: &str, value: serde_json::Value) -> Response {
 }
 
 async fn fs_stat(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let req = match decode_unary_path_request(ct, &body) {
         Some(r) => r,
         None => return (StatusCode::BAD_REQUEST, "decode").into_response(),
@@ -869,20 +1057,32 @@ async fn fs_stat(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
         Err(e) => return e.into_response(),
     };
     if !path.exists() {
-        let ct_out = if ct.contains("json") { "application/json" } else { "application/proto" };
+        let ct_out = if ct.contains("json") {
+            "application/json"
+        } else {
+            "application/proto"
+        };
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, ct_out)
-            .body(Body::from(r#"{"code":"not_found","message":"path not found"}"#))
+            .body(Body::from(
+                r#"{"code":"not_found","message":"path not found"}"#,
+            ))
             .unwrap();
     }
     let sid_for_root = pick_sandbox_id(&state, &headers).unwrap_or_default();
     let root = sandbox_fs_dir(&sid_for_root);
-    unary_json_response(ct, serde_json::json!({"entry": make_entry_info_json(&path, &root)}))
+    unary_json_response(
+        ct,
+        serde_json::json!({"entry": make_entry_info_json(&path, &root)}),
+    )
 }
 
 async fn fs_mkdir(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let req = match decode_unary_path_request(ct, &body) {
         Some(r) => r,
         None => return (StatusCode::BAD_REQUEST, "decode").into_response(),
@@ -896,11 +1096,17 @@ async fn fs_mkdir(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
     }
     let sid_for_root = pick_sandbox_id(&state, &headers).unwrap_or_default();
     let root = sandbox_fs_dir(&sid_for_root);
-    unary_json_response(ct, serde_json::json!({"entry": make_entry_info_json(&path, &root)}))
+    unary_json_response(
+        ct,
+        serde_json::json!({"entry": make_entry_info_json(&path, &root)}),
+    )
 }
 
 async fn fs_list(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let req = match decode_unary_path_request(ct, &body) {
         Some(r) => r,
         None => return (StatusCode::BAD_REQUEST, "decode").into_response(),
@@ -923,8 +1129,15 @@ async fn fs_list(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
     unary_json_response(ct, serde_json::json!({"entries": entries}))
 }
 
-async fn fs_remove(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+async fn fs_remove(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let req = match decode_unary_path_request(ct, &body) {
         Some(r) => r,
         None => return (StatusCode::BAD_REQUEST, "decode").into_response(),
@@ -942,7 +1155,10 @@ async fn fs_remove(State(state): State<Arc<AppState>>, headers: HeaderMap, body:
 }
 
 async fn fs_move(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let req = match decode_unary_path_request(ct, &body) {
         Some(r) => r,
         None => return (StatusCode::BAD_REQUEST, "decode").into_response(),
@@ -955,13 +1171,18 @@ async fn fs_move(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    if let Some(parent) = dst.parent() { let _ = std::fs::create_dir_all(parent); }
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     if let Err(e) = std::fs::rename(&src, &dst) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("move: {}", e)).into_response();
     }
     let sid_for_root = pick_sandbox_id(&state, &headers).unwrap_or_default();
     let root = sandbox_fs_dir(&sid_for_root);
-    unary_json_response(ct, serde_json::json!({"entry": make_entry_info_json(&dst, &root)}))
+    unary_json_response(
+        ct,
+        serde_json::json!({"entry": make_entry_info_json(&dst, &root)}),
+    )
 }
 
 // ---- /files (HTTP path-based read/write) -------------------------------
@@ -985,7 +1206,12 @@ async fn files_get(
         Err(e) => return e.into_response(),
     };
     match std::fs::read(&path) {
-        Ok(b) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/octet-stream")], b).into_response(),
+        Ok(b) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            b,
+        )
+            .into_response(),
         Err(e) => (StatusCode::NOT_FOUND, format!("not found: {}", e)).into_response(),
     }
 }
@@ -1000,9 +1226,14 @@ async fn files_post(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     // E2B uploads use multipart/form-data; for now we accept raw bytes too.
-    let content_type = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let payload: Vec<u8> = if content_type.contains("multipart/form-data") {
         // Extract first file part: naive boundary scanner.
         match extract_first_multipart_file(content_type, &body) {
@@ -1014,7 +1245,10 @@ async fn files_post(
     };
     match std::fs::write(&path, &payload) {
         Ok(_) => {
-            let name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let resp = serde_json::json!([{
                 "name": name,
                 "type": "file",
@@ -1036,13 +1270,17 @@ fn extract_first_multipart_file(content_type: &str, body: &[u8]) -> Option<Vec<u
         parts.push((i + found, i + found + sep_bytes.len()));
         i = i + found + sep_bytes.len();
     }
-    if parts.len() < 2 { return None; }
+    if parts.len() < 2 {
+        return None;
+    }
     let (_p1_start, p1_after_sep) = parts[0];
     let (p2_start, _) = parts[1];
     let part = &body[p1_after_sep..p2_start];
     // Skip CRLFs after boundary.
     let mut s = 0;
-    if part.starts_with(b"\r\n") { s += 2; }
+    if part.starts_with(b"\r\n") {
+        s += 2;
+    }
     // Find double CRLF that separates headers from body.
     let rest = &part[s..];
     let hdr_end = find_subseq(rest, b"\r\n\r\n")?;
@@ -1053,12 +1291,18 @@ fn extract_first_multipart_file(content_type: &str, body: &[u8]) -> Option<Vec<u
     Some(trimmed.to_vec())
 }
 
-fn memchr(needle: &[u8], hay: &[u8]) -> Option<usize> { find_subseq(hay, needle) }
+fn memchr(needle: &[u8], hay: &[u8]) -> Option<usize> {
+    find_subseq(hay, needle)
+}
 
 fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() { return None; }
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
     for i in 0..=hay.len() - needle.len() {
-        if &hay[i..i + needle.len()] == needle { return Some(i); }
+        if &hay[i..i + needle.len()] == needle {
+            return Some(i);
+        }
     }
     None
 }
@@ -1083,7 +1327,6 @@ fn sweep_expired(state: &Arc<AppState>) {
     }
 }
 
-
 // ---- sandbox snapshot → TOS ----------------------------------------------
 
 async fn sandbox_snapshot(
@@ -1099,37 +1342,64 @@ async fn sandbox_snapshot(
     // Make sure the sandbox exists (allow snapshot for both alive + already-dead).
     let root = sandbox_fs_dir(&sid);
     if !root.exists() {
-        return Err((StatusCode::NOT_FOUND, format!(r#"{{"code":"not_found","message":"sandbox {} fs dir not found"}}"#, sid)));
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                r#"{{"code":"not_found","message":"sandbox {} fs dir not found"}}"#,
+                sid
+            ),
+        ));
     }
 
     // tar.gz the dir in a blocking task (sync I/O).
     let root_c = root.clone();
     let sid_c = sid.clone();
-    let (key, body): (String, Vec<u8>) = tokio::task::spawn_blocking(move || -> std::io::Result<(String, Vec<u8>)> {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-        {
-            let enc = GzEncoder::new(&mut buf, Compression::fast());
-            let mut tar = tar::Builder::new(enc);
-            tar.append_dir_all(".", &root_c)?;
-            let enc = tar.into_inner()?;
-            enc.finish()?;
-        }
-        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let key = format!("harbor/sandboxes/{}/{}.tar.gz", sid_c, ts);
-        Ok((key, buf))
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(r#"{{"code":"internal","message":"join: {}"}}"#, e)))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(r#"{{"code":"internal","message":"tar: {}"}}"#, e)))?;
+    let (key, body): (String, Vec<u8>) =
+        tokio::task::spawn_blocking(move || -> std::io::Result<(String, Vec<u8>)> {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+            {
+                let enc = GzEncoder::new(&mut buf, Compression::fast());
+                let mut tar = tar::Builder::new(enc);
+                tar.append_dir_all(".", &root_c)?;
+                let enc = tar.into_inner()?;
+                enc.finish()?;
+            }
+            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            let key = format!("harbor/sandboxes/{}/{}.tar.gz", sid_c, ts);
+            Ok((key, buf))
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(r#"{{"code":"internal","message":"join: {}"}}"#, e),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(r#"{{"code":"internal","message":"tar: {}"}}"#, e),
+            )
+        })?;
 
     let size = body.len() as u64;
-    let resp = tos.bucket.put_object(&key, &body).await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!(r#"{{"code":"bad_gateway","message":"tos put: {}"}}"#, e)))?;
+    let resp = tos.bucket.put_object(&key, &body).await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(r#"{{"code":"bad_gateway","message":"tos put: {}"}}"#, e),
+        )
+    })?;
     let status = resp.status_code();
     if !(200..300).contains(&status) {
-        return Err((StatusCode::BAD_GATEWAY, format!(r#"{{"code":"bad_gateway","message":"tos status {}"}}"#, status)));
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                r#"{{"code":"bad_gateway","message":"tos status {}"}}"#,
+                status
+            ),
+        ));
     }
 
     let tos_url = format!("s3://{}/{}", tos.bucket_name, key);
@@ -1143,7 +1413,6 @@ async fn sandbox_snapshot(
         "region": tos.region,
     })))
 }
-
 
 // ---- E2B template build bridge -----------------------------------------
 //
@@ -1167,12 +1436,18 @@ const TEMPLATES_ROOT: &str = "/opt/inspect-api/templates";
 
 fn new_template_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
     format!("t{:020}", n)
 }
 fn new_build_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
     format!("b{:020}", n)
 }
 
@@ -1185,17 +1460,27 @@ fn sanitize_name(raw: &str) -> String {
             out.push(c);
         }
     }
-    if out.is_empty() { "tpl".into() } else { out }
+    if out.is_empty() {
+        "tpl".into()
+    } else {
+        out
+    }
 }
 
 #[derive(Deserialize, Default)]
 struct TemplateBuildRequestV3 {
-    #[serde(default)] alias: Option<String>,
-    #[serde(default)] name: Option<String>,
-    #[serde(default, rename = "cpuCount")] cpu_count: Option<u32>,
-    #[serde(default, rename = "memoryMB")] memory_mb: Option<u32>,
-    #[serde(default)] tags: Option<Vec<String>>,
-    #[serde(default, rename = "teamID")] team_id: Option<String>,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, rename = "cpuCount")]
+    cpu_count: Option<u32>,
+    #[serde(default, rename = "memoryMB")]
+    memory_mb: Option<u32>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default, rename = "teamID")]
+    team_id: Option<String>,
 }
 
 async fn templates_create_v3(
@@ -1204,7 +1489,10 @@ async fn templates_create_v3(
     Json(body): Json<TemplateBuildRequestV3>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let raw_name = body.name.or(body.alias).unwrap_or_else(|| "tpl".to_string());
+    let raw_name = body
+        .name
+        .or(body.alias)
+        .unwrap_or_else(|| "tpl".to_string());
     let name = sanitize_name(&raw_name);
     let template_id = new_template_id();
     let build_id = new_build_id();
@@ -1216,20 +1504,28 @@ async fn templates_create_v3(
         logs: tokio::sync::Mutex::new(Vec::new()),
     });
     state.template_builds.insert(build_id.clone(), tb);
-    state.template_id_to_build.insert(template_id.clone(), build_id.clone());
+    state
+        .template_id_to_build
+        .insert(template_id.clone(), build_id.clone());
     let _ = std::fs::create_dir_all(format!("{}/{}/files", STAGING_ROOT, build_id));
-    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({
-        "aliases": body.tags.clone().unwrap_or_default(),
-        "buildID": build_id,
-        "names": [&name],
-        "public": false,
-        "tags": body.tags.unwrap_or_default(),
-        "templateID": template_id,
-    }))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "aliases": body.tags.clone().unwrap_or_default(),
+            "buildID": build_id,
+            "names": [&name],
+            "public": false,
+            "tags": body.tags.unwrap_or_default(),
+            "templateID": template_id,
+        })),
+    ))
 }
 
 #[derive(Deserialize)]
-struct FilesHashPath { template_id: String, hash: String }
+struct FilesHashPath {
+    template_id: String,
+    hash: String,
+}
 
 async fn templates_files_hash(
     State(state): State<Arc<AppState>>,
@@ -1237,9 +1533,17 @@ async fn templates_files_hash(
     Path((template_id, hash)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let build_id = state.template_id_to_build.get(&template_id)
+    let build_id = state
+        .template_id_to_build
+        .get(&template_id)
         .map(|v| v.clone())
-        .ok_or((StatusCode::NOT_FOUND, format!(r#"{{"code":"not_found","message":"template {}"}}"#, template_id)))?;
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!(
+                r#"{{"code":"not_found","message":"template {}"}}"#,
+                template_id
+            ),
+        ))?;
     let token = format!("{}:{}", build_id, hash);
     let url = format!("/v1/files/{}", urlencoding_encode(&token));
     // Always say missing; let SDK upload to our presigned URL.
@@ -1253,7 +1557,9 @@ fn urlencoding_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -1266,7 +1572,7 @@ fn urlencoding_decode(s: &str) -> Option<String> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i+1..i+3]).ok()?;
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
             let v = u8::from_str_radix(hex, 16).ok()?;
             out.push(v);
             i += 3;
@@ -1286,7 +1592,9 @@ async fn files_upload(
 ) -> Result<StatusCode, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
     let raw = urlencoding_decode(&token).unwrap_or(token);
-    let (build_id, hash) = raw.split_once(':').ok_or((StatusCode::BAD_REQUEST, "bad token".into()))?;
+    let (build_id, hash) = raw
+        .split_once(':')
+        .ok_or((StatusCode::BAD_REQUEST, "bad token".into()))?;
     if !state.template_builds.contains_key(build_id) {
         return Err((StatusCode::NOT_FOUND, format!("unknown build {}", build_id)));
     }
@@ -1300,20 +1608,30 @@ async fn files_upload(
 
 #[derive(Deserialize, Debug)]
 struct TemplateStepV2 {
-    #[serde(rename = "type")] type_: String,
-    #[serde(default)] args: Vec<String>,
-    #[serde(default, rename = "filesHash")] files_hash: Option<String>,
-    #[serde(default)] force: bool,
+    #[serde(rename = "type")]
+    type_: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default, rename = "filesHash")]
+    files_hash: Option<String>,
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Deserialize, Debug)]
 struct TemplateBuildStartV2 {
-    #[serde(default)] force: bool,
-    #[serde(default, rename = "fromImage")] from_image: Option<String>,
-    #[serde(default, rename = "fromTemplate")] from_template: Option<String>,
-    #[serde(default, rename = "readyCmd")] ready_cmd: Option<String>,
-    #[serde(default, rename = "startCmd")] start_cmd: Option<String>,
-    #[serde(default)] steps: Vec<TemplateStepV2>,
+    #[serde(default)]
+    force: bool,
+    #[serde(default, rename = "fromImage")]
+    from_image: Option<String>,
+    #[serde(default, rename = "fromTemplate")]
+    from_template: Option<String>,
+    #[serde(default, rename = "readyCmd")]
+    ready_cmd: Option<String>,
+    #[serde(default, rename = "startCmd")]
+    start_cmd: Option<String>,
+    #[serde(default)]
+    steps: Vec<TemplateStepV2>,
 }
 
 async fn templates_build_start(
@@ -1323,9 +1641,14 @@ async fn templates_build_start(
     Json(body): Json<TemplateBuildStartV2>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let tb = state.template_builds.get(&build_id)
+    let tb = state
+        .template_builds
+        .get(&build_id)
         .map(|v| v.clone())
-        .ok_or((StatusCode::NOT_FOUND, format!("build {} not found", build_id)))?;
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("build {} not found", build_id),
+        ))?;
     if tb.template_id != template_id {
         return Err((StatusCode::BAD_REQUEST, format!("template/build mismatch")));
     }
@@ -1334,8 +1657,13 @@ async fn templates_build_start(
     let tpl_dir = format!("{}/{}", TEMPLATES_ROOT, tb.name);
     let _ = std::fs::create_dir_all(&tpl_dir);
 
-    let base = body.from_image.clone()
-        .or(body.from_template.clone().map(|t| format!("inspect-tpl-{}:latest", t)))
+    let base = body
+        .from_image
+        .clone()
+        .or(body
+            .from_template
+            .clone()
+            .map(|t| format!("inspect-tpl-{}:latest", t)))
         .unwrap_or_else(|| "python:3.12-slim".into());
 
     let mut dockerfile = format!("FROM {}\n", base);
@@ -1345,29 +1673,51 @@ async fn templates_build_start(
                 if let (Some(hash), Some(dst)) = (step.files_hash.as_ref(), step.args.last()) {
                     let src = format!("{}/{}/files/{}", STAGING_ROOT, build_id, hash);
                     let dst_in_ctx = format!("{}/{}", tpl_dir, hash);
-                    std::fs::copy(&src, &dst_in_ctx)
-                        .map_err(|e| (StatusCode::BAD_REQUEST, format!("missing upload {}: {}", hash, e)))?;
+                    std::fs::copy(&src, &dst_in_ctx).map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("missing upload {}: {}", hash, e),
+                        )
+                    })?;
                     dockerfile.push_str(&format!("COPY {} {}\n", hash, dst));
                 } else {
                     dockerfile.push_str(&format!("COPY {}\n", step.args.join(" ")));
                 }
             }
-            "RUN" | "ENV" | "WORKDIR" | "USER" | "EXPOSE" | "ARG" | "LABEL" | "CMD" | "ENTRYPOINT" => {
-                dockerfile.push_str(&format!("{} {}\n", step.type_.to_ascii_uppercase(), step.args.join(" ")));
+            "RUN" | "ENV" | "WORKDIR" | "USER" | "EXPOSE" | "ARG" | "LABEL" | "CMD"
+            | "ENTRYPOINT" => {
+                dockerfile.push_str(&format!(
+                    "{} {}\n",
+                    step.type_.to_ascii_uppercase(),
+                    step.args.join(" ")
+                ));
             }
             other => {
                 // Unknown step: emit as comment.
-                dockerfile.push_str(&format!("# UNKNOWN STEP {}: {}\n", other, step.args.join(" ")));
+                dockerfile.push_str(&format!(
+                    "# UNKNOWN STEP {}: {}\n",
+                    other,
+                    step.args.join(" ")
+                ));
             }
         }
     }
-    if let Some(c) = &body.start_cmd { dockerfile.push_str(&format!("CMD {}\n", c)); }
+    if let Some(c) = &body.start_cmd {
+        dockerfile.push_str(&format!("CMD {}\n", c));
+    }
     let dockerfile_path = format!("{}/Dockerfile", tpl_dir);
-    std::fs::write(&dockerfile_path, &dockerfile)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write Dockerfile: {}", e)))?;
+    std::fs::write(&dockerfile_path, &dockerfile).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write Dockerfile: {}", e),
+        )
+    })?;
     let toml_path = format!("{}/template.toml", tpl_dir);
     if !std::path::Path::new(&toml_path).exists() {
-        let _ = std::fs::write(&toml_path, format!("name = \"{}\"\npool_size = 16\ncontainers = 1\n", tb.name));
+        let _ = std::fs::write(
+            &toml_path,
+            format!("name = \"{}\"\npool_size = 16\ncontainers = 1\n", tb.name),
+        );
     }
 
     // Kick off api-rust build, capture log lines into the build buffer.
@@ -1385,8 +1735,10 @@ async fn templates_build_start(
         let mut resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                let mut s = tb_clone.status.lock().await; *s = BuildStatus::Error;
-                let mut l = tb_clone.logs.lock().await; l.push(format!("[shim] api-rust POST failed: {}", e));
+                let mut s = tb_clone.status.lock().await;
+                *s = BuildStatus::Error;
+                let mut l = tb_clone.logs.lock().await;
+                l.push(format!("[shim] api-rust POST failed: {}", e));
                 return;
             }
         };
@@ -1406,7 +1758,11 @@ async fn templates_build_start(
                 if line.contains("=== exit ") {
                     let exit_ok = line.contains("=== exit 0 ===");
                     let mut s = tb_clone.status.lock().await;
-                    *s = if exit_ok && !bad { BuildStatus::Ready } else { BuildStatus::Error };
+                    *s = if exit_ok && !bad {
+                        BuildStatus::Ready
+                    } else {
+                        BuildStatus::Error
+                    };
                 }
                 let mut l = tb_clone.logs.lock().await;
                 l.push(line);
@@ -1423,7 +1779,11 @@ async fn templates_build_start(
         };
         if need_finalize {
             let mut s = tb_clone.status.lock().await;
-            *s = if bad { BuildStatus::Error } else { BuildStatus::Ready };
+            *s = if bad {
+                BuildStatus::Error
+            } else {
+                BuildStatus::Ready
+            };
         }
     });
     Ok(StatusCode::ACCEPTED)
@@ -1435,9 +1795,14 @@ async fn templates_build_status(
     Path((_template_id, build_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let tb = state.template_builds.get(&build_id)
+    let tb = state
+        .template_builds
+        .get(&build_id)
         .map(|v| v.clone())
-        .ok_or((StatusCode::NOT_FOUND, format!("build {} not found", build_id)))?;
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("build {} not found", build_id),
+        ))?;
     let st = tb.status.lock().await;
     let st_str = match *st {
         BuildStatus::Pending => "waiting",
@@ -1458,16 +1823,19 @@ async fn templates_build_logs(
     Path((_template_id, build_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let tb = state.template_builds.get(&build_id)
+    let tb = state
+        .template_builds
+        .get(&build_id)
         .map(|v| v.clone())
-        .ok_or((StatusCode::NOT_FOUND, format!("build {} not found", build_id)))?;
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("build {} not found", build_id),
+        ))?;
     let logs = tb.logs.lock().await;
     Ok(Json(serde_json::json!({
         "logs": logs.clone(),
     })))
 }
-
-
 
 // ---- E2B full coverage: sandboxes/templates/tags/snapshots/volumes ------
 //
@@ -1488,10 +1856,14 @@ async fn sandboxes_list(
 
 #[derive(serde::Serialize)]
 struct SandboxMetrics {
-    #[serde(rename = "sandboxID")] sandbox_id: String,
-    #[serde(rename = "cpuUsedPct")] cpu_used_pct: f32,
-    #[serde(rename = "memUsedMB")] mem_used_mb: u32,
-    #[serde(rename = "diskUsedMB")] disk_used_mb: u32,
+    #[serde(rename = "sandboxID")]
+    sandbox_id: String,
+    #[serde(rename = "cpuUsedPct")]
+    cpu_used_pct: f32,
+    #[serde(rename = "memUsedMB")]
+    mem_used_mb: u32,
+    #[serde(rename = "diskUsedMB")]
+    disk_used_mb: u32,
     timestamp: String,
 }
 
@@ -1502,13 +1874,17 @@ async fn sandboxes_metrics(
     check_api_key(&state, &headers).await?;
     // We don't track per-sandbox compute (shared pool); return zero rows.
     let now = chrono::Utc::now().to_rfc3339();
-    let out: Vec<SandboxMetrics> = state.sandboxes.iter().map(|r| SandboxMetrics {
-        sandbox_id: r.key().clone(),
-        cpu_used_pct: 0.0,
-        mem_used_mb: 0,
-        disk_used_mb: 0,
-        timestamp: now.clone(),
-    }).collect();
+    let out: Vec<SandboxMetrics> = state
+        .sandboxes
+        .iter()
+        .map(|r| SandboxMetrics {
+            sandbox_id: r.key().clone(),
+            cpu_used_pct: 0.0,
+            mem_used_mb: 0,
+            disk_used_mb: 0,
+            timestamp: now.clone(),
+        })
+        .collect();
     Ok(Json(out))
 }
 
@@ -1518,10 +1894,15 @@ async fn sandbox_metrics_one(
     Path(sid): Path<String>,
 ) -> Result<Json<Vec<SandboxMetrics>>, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    state.sandboxes.get(&sid).ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
+    state
+        .sandboxes
+        .get(&sid)
+        .ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
     Ok(Json(vec![SandboxMetrics {
         sandbox_id: sid,
-        cpu_used_pct: 0.0, mem_used_mb: 0, disk_used_mb: 0,
+        cpu_used_pct: 0.0,
+        mem_used_mb: 0,
+        disk_used_mb: 0,
         timestamp: chrono::Utc::now().to_rfc3339(),
     }]))
 }
@@ -1532,7 +1913,10 @@ async fn sandbox_logs(
     Path(sid): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    state.sandboxes.get(&sid).ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
+    state
+        .sandboxes
+        .get(&sid)
+        .ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
     // Shared pool: no aggregate sandbox log. SDK gets an empty page.
     Ok(Json(serde_json::json!({ "logs": [] })))
 }
@@ -1543,10 +1927,14 @@ async fn sandbox_pause(
     Path(sid): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let mut rec = state.sandboxes.get(&sid)
+    let mut rec = state
+        .sandboxes
+        .get(&sid)
         .map(|r| r.clone())
         .ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
-    if rec.state == "paused" { return Ok(StatusCode::NO_CONTENT); }
+    if rec.state == "paused" {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     rec.state = "paused".into();
     state.sandboxes.insert(sid.clone(), rec.clone());
     persist_sandbox(&rec);
@@ -1559,7 +1947,9 @@ async fn sandbox_resume(
     Path(sid): Path<String>,
 ) -> Result<Json<SandboxRec>, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let mut rec = state.sandboxes.get(&sid)
+    let mut rec = state
+        .sandboxes
+        .get(&sid)
         .map(|r| r.clone())
         .ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
     rec.state = "running".into();
@@ -1577,7 +1967,9 @@ async fn sandbox_connect(
     Path(sid): Path<String>,
 ) -> Result<Json<SandboxRec>, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let rec = state.sandboxes.get(&sid)
+    let rec = state
+        .sandboxes
+        .get(&sid)
         .map(|r| r.clone())
         .ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
     Ok(Json(rec))
@@ -1589,7 +1981,9 @@ async fn sandbox_refreshes(
     Path(sid): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let mut rec = state.sandboxes.get(&sid)
+    let mut rec = state
+        .sandboxes
+        .get(&sid)
         .map(|r| r.clone())
         .ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
     // Heartbeat: extend endAt by the original lease window (15min).
@@ -1609,8 +2003,17 @@ async fn sandbox_snapshots_e2b(
 ) -> Result<(StatusCode, Json<SnapshotRec>), (StatusCode, String)> {
     // Delegate to the existing host-fs tarball → TOS handler.
     let json = sandbox_snapshot(State(state.clone()), Path(sid.clone()), headers).await?;
-    let tos_url = json.0.get("tos_url").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let template_id = state.sandboxes.get(&sid).map(|r| r.template_id.clone()).unwrap_or_default();
+    let tos_url = json
+        .0
+        .get("tos_url")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let template_id = state
+        .sandboxes
+        .get(&sid)
+        .map(|r| r.template_id.clone())
+        .unwrap_or_default();
     let snap_id = format!("snap{}", chrono::Utc::now().format("%Y%m%dT%H%M%S%fZ"));
     let snap = SnapshotRec {
         snapshot_id: snap_id.clone(),
@@ -1636,12 +2039,14 @@ async fn snapshots_list(
 
 #[derive(serde::Serialize)]
 struct TemplateInfo {
-    #[serde(rename = "templateID")] template_id: String,
+    #[serde(rename = "templateID")]
+    template_id: String,
     name: String,
     aliases: Vec<String>,
     tags: Vec<String>,
     public: bool,
-    #[serde(rename = "buildID")] build_id: String,
+    #[serde(rename = "buildID")]
+    build_id: String,
 }
 
 fn list_template_names_on_disk() -> Vec<String> {
@@ -1677,7 +2082,11 @@ async fn templates_list(
     let names = list_template_names_on_disk();
     let mut out = Vec::with_capacity(names.len());
     for name in names {
-        let tags = state.template_tags.get(&name).map(|v| v.clone()).unwrap_or_default();
+        let tags = state
+            .template_tags
+            .get(&name)
+            .map(|v| v.clone())
+            .unwrap_or_default();
         out.push(TemplateInfo {
             template_id: format!("t-{}", name),
             name: name.clone(),
@@ -1706,9 +2115,16 @@ async fn template_get(
     };
     let tpl_dir = format!("{}/{}", TEMPLATES_ROOT, name);
     if !std::path::Path::new(&tpl_dir).exists() {
-        return Err((StatusCode::NOT_FOUND, format!("template {} not found", name)));
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("template {} not found", name),
+        ));
     }
-    let tags = state.template_tags.get(&name).map(|v| v.clone()).unwrap_or_default();
+    let tags = state
+        .template_tags
+        .get(&name)
+        .map(|v| v.clone())
+        .unwrap_or_default();
     Ok(Json(TemplateInfo {
         template_id: format!("t-{}", name),
         name: name.clone(),
@@ -1745,9 +2161,11 @@ async fn template_delete(
 
 #[derive(serde::Deserialize)]
 struct TemplateUpdate {
-    #[serde(default)] public: Option<bool>,
+    #[serde(default)]
+    public: Option<bool>,
     // We accept other fields silently — schema matches E2B but we ignore most.
-    #[serde(flatten)] _extra: serde_json::Value,
+    #[serde(flatten)]
+    _extra: serde_json::Value,
 }
 
 async fn template_update(
@@ -1775,9 +2193,12 @@ async fn templates_create_legacy(
 
 #[derive(serde::Deserialize)]
 struct AssignTagsBody {
-    #[serde(default, rename = "templateID")] template_id: Option<String>,
-    #[serde(default)] name: Option<String>,
-    #[serde(default)] tags: Vec<String>,
+    #[serde(default, rename = "templateID")]
+    template_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 async fn tags_assign(
@@ -1786,11 +2207,14 @@ async fn tags_assign(
     Json(body): Json<AssignTagsBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let name = body.template_id
+    let name = body
+        .template_id
         .map(|t| t.strip_prefix("t-").unwrap_or(&t).to_string())
         .or(body.name)
         .ok_or((StatusCode::BAD_REQUEST, "missing templateID or name".into()))?;
-    state.template_tags.entry(name)
+    state
+        .template_tags
+        .entry(name)
         .or_insert_with(Vec::new)
         .extend(body.tags);
     Ok(StatusCode::NO_CONTENT)
@@ -1802,7 +2226,8 @@ async fn tags_remove(
     Json(body): Json<AssignTagsBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let name = body.template_id
+    let name = body
+        .template_id
         .map(|t| t.strip_prefix("t-").unwrap_or(&t).to_string())
         .or(body.name)
         .ok_or((StatusCode::BAD_REQUEST, "missing templateID or name".into()))?;
@@ -1819,7 +2244,11 @@ async fn tags_get(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
     let name = tid.strip_prefix("t-").unwrap_or(&tid).to_string();
-    let tags = state.template_tags.get(&name).map(|v| v.clone()).unwrap_or_default();
+    let tags = state
+        .template_tags
+        .get(&name)
+        .map(|v| v.clone())
+        .unwrap_or_default();
     Ok(Json(serde_json::json!({ "tags": tags })))
 }
 
@@ -1835,8 +2264,10 @@ const VOLUMES_ROOT: &str = "/var/lib/e2b-shim/volumes";
 
 #[derive(serde::Deserialize)]
 struct CreateVolumeBody {
-    #[serde(default)] name: Option<String>,
-    #[serde(default, rename = "sizeMB")] size_mb: Option<u32>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, rename = "sizeMB")]
+    size_mb: Option<u32>,
 }
 
 async fn volumes_create(
@@ -1863,7 +2294,9 @@ async fn volumes_list(
     headers: HeaderMap,
 ) -> Result<Json<Vec<VolumeRec>>, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    Ok(Json(state.volumes.iter().map(|r| r.value().clone()).collect()))
+    Ok(Json(
+        state.volumes.iter().map(|r| r.value().clone()).collect(),
+    ))
 }
 
 async fn volume_get(
@@ -1872,7 +2305,9 @@ async fn volume_get(
     Path(vid): Path<String>,
 ) -> Result<Json<VolumeRec>, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let rec = state.volumes.get(&vid)
+    let rec = state
+        .volumes
+        .get(&vid)
         .map(|r| r.clone())
         .ok_or((StatusCode::NOT_FOUND, format!("volume {} not found", vid)))?;
     Ok(Json(rec))
@@ -1889,22 +2324,32 @@ async fn volume_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-
 // ---- main ---------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let upstream = std::env::var("E2B_SHIM_UPSTREAM").unwrap_or_else(|_| "http://127.0.0.1:8000".into());
-    let port: u16 = std::env::var("E2B_SHIM_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8001);
+    let upstream =
+        std::env::var("E2B_SHIM_UPSTREAM").unwrap_or_else(|_| "http://127.0.0.1:8000".into());
+    let port: u16 = std::env::var("E2B_SHIM_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8001);
     let api_key = std::env::var("E2B_SHIM_API_KEY").ok();
 
-    eprintln!("[e2b-shim] upstream={} port={} api_key={}",
-        upstream, port, if api_key.is_some() { "set" } else { "open" });
+    eprintln!(
+        "[e2b-shim] upstream={} port={} api_key={}",
+        upstream,
+        port,
+        if api_key.is_some() { "set" } else { "open" }
+    );
 
     let prior = load_registry();
     let tos = match tos_from_env() {
         Some(t) => {
-            eprintln!("[e2b-shim] TOS configured: bucket={} endpoint={}", t.bucket_name, t.endpoint);
+            eprintln!(
+                "[e2b-shim] TOS configured: bucket={} endpoint={}",
+                t.bucket_name, t.endpoint
+            );
             Some(Arc::new(t))
         }
         None => {
@@ -1915,7 +2360,10 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         sandboxes: DashMap::new(),
         upstream,
-        http: reqwest::Client::builder().http1_only().pool_max_idle_per_host(64).build()?,
+        http: reqwest::Client::builder()
+            .http1_only()
+            .pool_max_idle_per_host(64)
+            .build()?,
         api_key,
         tos,
         template_builds: DashMap::new(),
@@ -1928,7 +2376,11 @@ async fn main() -> Result<()> {
         let sid = rec.sandbox_id.clone();
         state.sandboxes.insert(sid, rec);
     }
-    eprintln!("[e2b-shim] restored {} sandboxes from {}", state.sandboxes.len(), SANDBOX_REGISTRY_DIR);
+    eprintln!(
+        "[e2b-shim] restored {} sandboxes from {}",
+        state.sandboxes.len(),
+        SANDBOX_REGISTRY_DIR
+    );
 
     let app = Router::new()
         .route("/health", get(shim_health))
@@ -1940,12 +2392,21 @@ async fn main() -> Result<()> {
         .route("/v3/templates", post(templates_create_v3))
         .route("/templates/:tid/files/:hash", get(templates_files_hash))
         .route("/v1/files/:token", axum::routing::put(files_upload))
-        .route("/v2/templates/:tid/builds/:bid", post(templates_build_start))
+        .route(
+            "/v2/templates/:tid/builds/:bid",
+            post(templates_build_start),
+        )
         .route("/templates/:tid/builds/:bid", post(templates_build_start))
-        .route("/templates/:tid/builds/:bid/status", get(templates_build_status))
-        .route("/templates/:tid/builds/:bid/logs", get(templates_build_logs))
+        .route(
+            "/templates/:tid/builds/:bid/status",
+            get(templates_build_status),
+        )
+        .route(
+            "/templates/:tid/builds/:bid/logs",
+            get(templates_build_logs),
+        )
         // Sandboxes — full E2B coverage (metadata-only for stateful ops)
-        .route("/sandboxes/list", get(sandboxes_list))   // some clients hit /list
+        .route("/sandboxes/list", get(sandboxes_list)) // some clients hit /list
         .route("/v2/sandboxes", get(sandboxes_list))
         .route("/sandboxes/metrics", get(sandboxes_metrics))
         .route("/sandboxes/:id/metrics", get(sandbox_metrics_one))
@@ -1957,9 +2418,17 @@ async fn main() -> Result<()> {
         .route("/sandboxes/:id/refreshes", post(sandbox_refreshes))
         .route("/sandboxes/:id/snapshots", post(sandbox_snapshots_e2b))
         // Templates — list/detail/alias/delete/update + older create endpoints
-        .route("/templates", get(templates_list).post(templates_create_legacy))
+        .route(
+            "/templates",
+            get(templates_list).post(templates_create_legacy),
+        )
         .route("/v2/templates", post(templates_create_legacy))
-        .route("/templates/:tid", get(template_get).delete(template_delete).post(template_update))
+        .route(
+            "/templates/:tid",
+            get(template_get)
+                .delete(template_delete)
+                .post(template_update),
+        )
         .route("/templates/:tid", axum::routing::patch(template_update))
         .route("/v2/templates/:tid", axum::routing::patch(template_update))
         .route("/templates/aliases/:alias", get(template_get_by_alias))
@@ -2011,17 +2480,27 @@ async fn main() -> Result<()> {
 fn general_b64_decode(s: &str) -> Option<Vec<u8>> {
     // Inverse of general_b64.
     let mut tbl = [255u8; 256];
-    for (i, c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {
+    for (i, c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .iter()
+        .enumerate()
+    {
         tbl[*c as usize] = i as u8;
     }
-    let bytes: Vec<u8> = s.bytes().filter(|b| *b != b'\n' && *b != b'\r' && *b != b' ').collect();
+    let bytes: Vec<u8> = s
+        .bytes()
+        .filter(|b| *b != b'\n' && *b != b'\r' && *b != b' ')
+        .collect();
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
     let mut buf = 0u32;
     let mut bits = 0u32;
     for b in bytes.iter() {
-        if *b == b'=' { break; }
+        if *b == b'=' {
+            break;
+        }
         let v = tbl[*b as usize];
-        if v == 255 { return None; }
+        if v == 255 {
+            return None;
+        }
         buf = (buf << 6) | (v as u32);
         bits += 6;
         if bits >= 8 {
@@ -2162,10 +2641,22 @@ mod tests {
 
     #[test]
     fn codec_dispatch() {
-        assert!(matches!(codec_from_content_type("application/json"), Codec::Json));
-        assert!(matches!(codec_from_content_type("application/connect+json"), Codec::Json));
-        assert!(matches!(codec_from_content_type("application/proto"), Codec::Proto));
-        assert!(matches!(codec_from_content_type("application/connect+proto"), Codec::Proto));
+        assert!(matches!(
+            codec_from_content_type("application/json"),
+            Codec::Json
+        ));
+        assert!(matches!(
+            codec_from_content_type("application/connect+json"),
+            Codec::Json
+        ));
+        assert!(matches!(
+            codec_from_content_type("application/proto"),
+            Codec::Proto
+        ));
+        assert!(matches!(
+            codec_from_content_type("application/connect+proto"),
+            Codec::Proto
+        ));
         assert!(matches!(codec_from_content_type(""), Codec::Proto));
     }
 

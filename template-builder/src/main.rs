@@ -55,8 +55,12 @@ struct TemplateCfg {
     #[serde(default = "default_pool_size")]
     pool_size: usize,
 }
-fn default_base() -> String { "python:3.12-slim".into() }
-fn default_pool_size() -> usize { 32 }
+fn default_base() -> String {
+    "python:3.12-slim".into()
+}
+fn default_pool_size() -> usize {
+    32
+}
 
 fn build(root: &Path, name: &str) -> Result<()> {
     let tpl_dir = root.join("templates").join(name);
@@ -69,15 +73,20 @@ fn build(root: &Path, name: &str) -> Result<()> {
     // of worker-rust/inspect_pb2.py + access to env INSPECT_TPL_NAME / TAG.
     let compose_yml = tpl_dir.join("docker-compose.yml");
     let compose_yaml = tpl_dir.join("compose.yaml");
-    let compose_path = if compose_yml.exists() { Some(compose_yml) }
-                       else if compose_yaml.exists() { Some(compose_yaml) }
-                       else { None };
+    let compose_path = if compose_yml.exists() {
+        Some(compose_yml)
+    } else if compose_yaml.exists() {
+        Some(compose_yaml)
+    } else {
+        None
+    };
     if let Some(p) = compose_path {
         return build_via_compose(root, &tpl_dir, name, &p);
     }
     let cfg: TemplateCfg = toml::from_str(
         &fs::read_to_string(&toml_path).with_context(|| format!("read {}", toml_path.display()))?,
-    ).with_context(|| format!("parse {}", toml_path.display()))?;
+    )
+    .with_context(|| format!("parse {}", toml_path.display()))?;
 
     let tag = format!("inspect-tpl-{}:latest", name);
     let worker_bin = root.join("worker-rust/target/release/worker-rust");
@@ -97,7 +106,8 @@ fn build(root: &Path, name: &str) -> Result<()> {
     }
 
     let pip_index = std::env::var("PIP_INDEX_URL").unwrap_or_else(|_| DEFAULT_PIP_INDEX.into());
-    let pip_trusted = std::env::var("PIP_TRUSTED_HOST").unwrap_or_else(|_| DEFAULT_PIP_TRUSTED.into());
+    let pip_trusted =
+        std::env::var("PIP_TRUSTED_HOST").unwrap_or_else(|_| DEFAULT_PIP_TRUSTED.into());
 
     let bd = tempfile::tempdir().context("mktempdir")?;
     let bd_path = bd.path();
@@ -173,10 +183,12 @@ fn build_via_compose(root: &Path, tpl_dir: &Path, name: &str, compose_path: &Pat
     let probe = Command::new("docker").args(["compose", "version"]).output();
     match probe {
         Ok(o) if o.status.success() => {}
-        _ => return Err(anyhow!(
-            "`docker compose` not available. Install the compose plugin \
+        _ => {
+            return Err(anyhow!(
+                "`docker compose` not available. Install the compose plugin \
              (apt-get install docker-compose-plugin) or use a docker that bundles it."
-        )),
+            ))
+        }
     }
 
     // Stage a build context: copy worker binary + pb2.py + every file from
@@ -199,31 +211,47 @@ fn build_via_compose(root: &Path, tpl_dir: &Path, name: &str, compose_path: &Pat
     }
 
     let compose_in_ctx = bd_path.join(compose_path.file_name().unwrap());
-    println!("[compose] context={} file={}", bd_path.display(), compose_in_ctx.display());
-    println!("[compose] INSPECT_TPL_NAME={} INSPECT_TPL_TAG={}", name, tag);
+    println!(
+        "[compose] context={} file={}",
+        bd_path.display(),
+        compose_in_ctx.display()
+    );
+    println!(
+        "[compose] INSPECT_TPL_NAME={} INSPECT_TPL_TAG={}",
+        name, tag
+    );
 
     let status = Command::new("docker")
-        .args(["compose", "-f"]).arg(&compose_in_ctx)
+        .args(["compose", "-f"])
+        .arg(&compose_in_ctx)
         .args(["build"])
         .env("INSPECT_TPL_NAME", name)
         .env("INSPECT_TPL_TAG", &tag)
         .status()
         .context("spawn docker compose build")?;
     if !status.success() {
-        return Err(anyhow!("docker compose build failed (exit {:?})", status.code()));
+        return Err(anyhow!(
+            "docker compose build failed (exit {:?})",
+            status.code()
+        ));
     }
 
     // Verify the expected tag exists.
-    let inspect = Command::new("docker").args(["image", "inspect", &tag])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+    let inspect = Command::new("docker")
+        .args(["image", "inspect", &tag])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     match inspect {
         Ok(s) if s.success() => println!("=== built {} via compose ===", tag),
-        _ => return Err(anyhow!(
-            "docker compose build succeeded but tag '{}' was not produced.\n\
+        _ => {
+            return Err(anyhow!(
+                "docker compose build succeeded but tag '{}' was not produced.\n\
              Ensure your compose file's service has `image: {}` (or use `${{INSPECT_TPL_TAG}}`).",
-            tag, tag
-        )),
+                tag,
+                tag
+            ))
+        }
     }
     Ok(())
 }
@@ -237,12 +265,18 @@ fn push_to_registry(name: &str, push_tag: &str) -> Result<()> {
     let remote_tag = format!("{}/{}/inspect-tpl-{}:{}", host, ns, name, push_tag);
 
     println!("[push] tagging {} → {}", local_tag, remote_tag);
-    let st = Command::new("docker").args(["tag", &local_tag, &remote_tag]).status()
+    let st = Command::new("docker")
+        .args(["tag", &local_tag, &remote_tag])
+        .status()
         .context("spawn docker tag")?;
-    if !st.success() { return Err(anyhow!("docker tag failed")); }
+    if !st.success() {
+        return Err(anyhow!("docker tag failed"));
+    }
 
     println!("[push] pushing {}", remote_tag);
-    let st = Command::new("docker").args(["push", &remote_tag]).status()
+    let st = Command::new("docker")
+        .args(["push", &remote_tag])
+        .status()
         .context("spawn docker push")?;
     if !st.success() {
         return Err(anyhow!(
@@ -258,7 +292,9 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let root = args.root.unwrap_or_else(|| PathBuf::from(ROOT));
     if args.names.is_empty() {
-        return Err(anyhow!("no template names provided (try: template-build default)"));
+        return Err(anyhow!(
+            "no template names provided (try: template-build default)"
+        ));
     }
     for name in &args.names {
         build(&root, name)?;
@@ -294,11 +330,11 @@ pool_size = 32
     fn template_cfg_uses_defaults_when_fields_missing() {
         // All fields are #[serde(default)]; empty TOML should parse and use defaults.
         let cfg: TemplateCfg = toml::from_str("").expect("parse empty");
-        assert_eq!(cfg.name, "");                          // default_name = empty
-        assert_eq!(cfg.base_image, default_base());        // python:3.12-slim
+        assert_eq!(cfg.name, ""); // default_name = empty
+        assert_eq!(cfg.base_image, default_base()); // python:3.12-slim
         assert!(cfg.prewarm.is_empty());
         assert!(cfg.extra_pip.is_empty());
-        assert_eq!(cfg.pool_size, default_pool_size());    // 32
+        assert_eq!(cfg.pool_size, default_pool_size()); // 32
     }
 
     #[test]
