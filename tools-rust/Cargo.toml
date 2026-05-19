@@ -17,6 +17,9 @@ uuid = { version = "1", features = ["v4"] }
 dashmap = "6"
 tower = "0.5"
 tower-http = { version = "0.5", features = ["trace"] }
+regex = "1"
+walkdir = "2"
+globset = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mimalloc = { version = "0.1", default-features = false }
