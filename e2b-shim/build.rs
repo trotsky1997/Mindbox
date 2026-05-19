@@ -3,9 +3,8 @@ fn main() -> std::io::Result<()> {
         &[
             "../proto/envd/process.proto",
             "../proto/envd/filesystem.proto",
-            "../proto/inspect.proto",
         ],
-        &["../proto/envd", "../proto"],
+        &["../proto/envd"],
     )?;
     Ok(())
 }

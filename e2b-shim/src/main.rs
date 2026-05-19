@@ -73,12 +73,6 @@ struct SandboxRec {
     disk_size_mb: u32,
     #[serde(default = "default_state")]
     state: String,
-    /// Which upstream serves this sandbox:
-    ///   "python-pool" → worker-rust fork pool via /exec_hot (legacy)
-    ///   "tools"       → tools-rust daemon via /v2/sessions/:sid/tools/:name
-    /// Detected at create time from the templateID prefix (tools-*).
-    #[serde(default = "default_backend")]
-    backend: String,
 }
 
 fn default_cpu() -> u32 {
@@ -92,14 +86,6 @@ fn default_disk() -> u32 {
 }
 fn default_state() -> String {
     "running".into()
-}
-fn default_backend() -> String {
-    "python-pool".into()
-}
-
-/// True if a template name targets the tools-rust daemon backend.
-fn is_tools_template(template_id: &str) -> bool {
-    template_id == "tools" || template_id.starts_with("tools-")
 }
 
 /// Forward a single tool call to the tools-rust daemon via api-rust's /v2
@@ -138,15 +124,6 @@ async fn forward_tools_tool(
         ));
     }
     Ok(v)
-}
-
-/// Look up a sandbox's backend ("python-pool" or "tools"), or default.
-fn sandbox_backend(state: &AppState, sid: &str) -> String {
-    state
-        .sandboxes
-        .get(sid)
-        .map(|r| r.backend.clone())
-        .unwrap_or_else(default_backend)
 }
 
 /// Strip leading slash and ".." segments so the tools daemon's path
@@ -209,42 +186,6 @@ fn load_registry() -> Vec<SandboxRec> {
 
 fn sandbox_fs_dir(sid: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(SANDBOX_FS_ROOT).join(sid)
-}
-
-fn ensure_sandbox_fs(sid: &str) -> std::io::Result<std::path::PathBuf> {
-    let d = sandbox_fs_dir(sid);
-    std::fs::create_dir_all(&d)?;
-    Ok(d)
-}
-
-fn collect_files(root: &std::path::Path) -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
-    fn walk(
-        base: &std::path::Path,
-        dir: &std::path::Path,
-        out: &mut std::collections::HashMap<String, String>,
-    ) {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in rd.flatten() {
-            let p = entry.path();
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if meta.is_dir() {
-                walk(base, &p, out);
-            } else if meta.is_file() {
-                if let Ok(rel) = p.strip_prefix(base) {
-                    if let Ok(content) = std::fs::read_to_string(&p) {
-                        out.insert(rel.to_string_lossy().into_owned(), content);
-                    }
-                }
-            }
-        }
-    }
-    walk(root, root, &mut out);
-    out
 }
 
 struct AppState {
@@ -397,47 +338,9 @@ async fn create_sandbox(
     } else {
         body.template_id.clone()
     };
-    let backend = if is_tools_template(&template_id) {
-        "tools".to_string()
-    } else {
-        // python-pool: verify template exists upstream (the /templates list
-        // is python-pool-only at the moment).
-        let url = format!("{}/templates", state.upstream);
-        let resp = state
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream: {}", e)))?;
-        let v: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream json: {}", e)))?;
-        let templates = v
-            .get("templates")
-            .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let known: Vec<String> = templates
-            .iter()
-            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
-            .collect();
-        if !known.contains(&template_id) {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!(
-                    r#"{{"code":"not_found","message":"template '{}' not found; available: {:?}"}}"#,
-                    template_id, known
-                ),
-            ));
-        }
-        "python-pool".to_string()
-    };
 
-    // For tools backend, the upstream daemon allocates the session id;
-    // we reuse it as the e2b sandbox_id so SDK clients and daemon agree
-    // on a single identifier.
-    let sid = if backend == "tools" {
+    // Daemon allocates the session id; use it as the e2b sandbox_id.
+    let sid = {
         let url = format!("{}/v2/sessions", state.upstream);
         let resp = state
             .http
@@ -464,11 +367,6 @@ async fn create_sandbox(
                 StatusCode::BAD_GATEWAY,
                 "upstream /v2/sessions: missing session_id".into(),
             ))?
-    } else {
-        format!(
-            "i{}",
-            &uuid::Uuid::new_v4().to_string().replace('-', "")[..20]
-        )
     };
     let now = Utc::now();
     let end = now + chrono::Duration::seconds(body.timeout.unwrap_or(900) as i64);
@@ -492,16 +390,8 @@ async fn create_sandbox(
         memory_mb: 1024,
         disk_size_mb: 4096,
         state: "running".into(),
-        backend: backend.clone(),
     };
-    // python-pool needs a host fs dir under /var/lib/e2b-shim/sandboxes/<sid>
-    // for the Python wrapper's file collection. tools backend lives in the
-    // daemon's own /sandboxes/<sid> so no host-side dir to provision.
-    if backend == "python-pool" {
-        if let Err(e) = ensure_sandbox_fs(&sid) {
-            eprintln!("[shim] WARN ensure_sandbox_fs({}): {}", sid, e);
-        }
-    }
+
     state.sandboxes.insert(sid.clone(), rec.clone());
     persist_sandbox(&rec);
     Ok((StatusCode::CREATED, Json(rec)))
@@ -529,20 +419,13 @@ async fn delete_sandbox(
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
-    let backend = state
-        .sandboxes
-        .get(&sid)
-        .map(|r| r.backend.clone())
-        .unwrap_or_else(default_backend);
     state.sandboxes.remove(&sid);
     forget_sandbox(&sid);
     let _ = std::fs::remove_dir_all(sandbox_fs_dir(&sid));
-    if backend == "tools" {
-        // Best-effort cleanup; ignore errors so a half-stuck upstream
-        // can't keep a sandbox visible to the SDK.
-        let url = format!("{}/v2/sessions/{}", state.upstream, sid);
-        let _ = state.http.delete(&url).send().await;
-    }
+    // Best-effort upstream cleanup; ignore errors so a half-stuck upstream
+    // can't keep a sandbox visible to the SDK.
+    let url = format!("{}/v2/sessions/{}", state.upstream, sid);
+    let _ = state.http.delete(&url).send().await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -612,34 +495,6 @@ fn enc_resp(r: &pb::StartResponse, codec: Codec) -> Bytes {
 
 /// Hand-encode StartResponse as canonical proto3 JSON.
 /// Mirrors the oneof flattening: ProcessEvent.event oneof appears as a sibling field.
-fn response_to_json(r: &pb::StartResponse) -> serde_json::Value {
-    use serde_json::json;
-    let event_json = r
-        .event
-        .as_ref()
-        .and_then(|e| e.event.as_ref())
-        .map(|ev| match ev {
-            ProcessEventOneof::Start(s) => json!({"start": {"pid": s.pid}}),
-            ProcessEventOneof::Data(d) => {
-                let inner = match &d.output {
-                    Some(data_event::Output::Stdout(b)) => json!({"stdout": general_b64(b)}),
-                    Some(data_event::Output::Stderr(b)) => json!({"stderr": general_b64(b)}),
-                    Some(data_event::Output::Pty(b)) => json!({"pty":    general_b64(b)}),
-                    None => json!({}),
-                };
-                json!({"data": inner})
-            }
-            ProcessEventOneof::End(e) => json!({"end": {
-                "exitCode": e.exit_code,
-                "exited": e.exited,
-                "status": e.status,
-                "error": e.error,
-            }}),
-            ProcessEventOneof::Keepalive(_) => json!({"keepalive": {}}),
-        });
-    json!({ "event": event_json })
-}
-
 fn general_b64(b: &[u8]) -> String {
     // Standard base64 (proto3 JSON canonical encoding for bytes).
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -669,6 +524,34 @@ fn general_b64(b: &[u8]) -> String {
         out.push('=');
     }
     out
+}
+
+fn response_to_json(r: &pb::StartResponse) -> serde_json::Value {
+    use serde_json::json;
+    let event_json = r
+        .event
+        .as_ref()
+        .and_then(|e| e.event.as_ref())
+        .map(|ev| match ev {
+            ProcessEventOneof::Start(s) => json!({"start": {"pid": s.pid}}),
+            ProcessEventOneof::Data(d) => {
+                let inner = match &d.output {
+                    Some(data_event::Output::Stdout(b)) => json!({"stdout": general_b64(b)}),
+                    Some(data_event::Output::Stderr(b)) => json!({"stderr": general_b64(b)}),
+                    Some(data_event::Output::Pty(b)) => json!({"pty":    general_b64(b)}),
+                    None => json!({}),
+                };
+                json!({"data": inner})
+            }
+            ProcessEventOneof::End(e) => json!({"end": {
+                "exitCode": e.exit_code,
+                "exited": e.exited,
+                "status": e.status,
+                "error": e.error,
+            }}),
+            ProcessEventOneof::Keepalive(_) => json!({"keepalive": {}}),
+        });
+    json!({ "event": event_json })
 }
 
 // ---- /process.Process/Start ---------------------------------------------
@@ -750,53 +633,6 @@ fn decode_start_request(ct: &str, body: &[u8]) -> Option<pb::StartRequest> {
     }
 }
 
-fn build_python_subprocess(
-    args_combined: Vec<String>,
-    envs: std::collections::HashMap<String, String>,
-    cwd: Option<String>,
-) -> String {
-    // Convert the E2B ProcessConfig into Python code that subprocess.runs it.
-    // We use json to safely embed the args/env into the Python source.
-    let args_json = serde_json::to_string(&args_combined).unwrap_or("[]".into());
-    let env_json = serde_json::to_string(&envs).unwrap_or("{}".into());
-    let cwd_lit = match cwd {
-        Some(c) => format!("{:?}", c),
-        None => "None".to_string(),
-    };
-    format!(
-        r#"
-import subprocess, os, sys, json
-_args = {args_json}
-_env_overrides = {env_json}
-_cwd = {cwd_lit}
-_env = os.environ.copy()
-_env.update(_env_overrides)
-_r = subprocess.run(_args, env=_env, cwd=_cwd, capture_output=True, text=True)
-sys.stdout.write(_r.stdout)
-sys.stderr.write(_r.stderr)
-sys.exit(_r.returncode)
-"#,
-        args_json = args_json,
-        env_json = env_json,
-        cwd_lit = cwd_lit,
-    )
-}
-
-#[derive(Serialize, Deserialize)]
-struct UpstreamExecResp {
-    stdout: String,
-    stderr: String,
-    exit_code: i32,
-    #[serde(default)]
-    elapsed_ms: u64,
-    #[serde(default)]
-    output_files: std::collections::HashMap<String, String>,
-    #[serde(default)]
-    deleted_files: Vec<String>,
-    #[serde(default)]
-    output_files_b64: std::collections::HashMap<String, String>,
-}
-
 async fn process_start(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -806,40 +642,13 @@ async fn process_start(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/connect+proto");
-
     let codec = codec_from_content_type(content_type);
-    eprintln!(
-        "[shim] start: ct={:?} body_len={}",
-        content_type,
-        body.len()
-    );
     let req: pb::StartRequest = match decode_start_request(content_type, &body) {
         Some(r) => r,
-        None => {
-            eprintln!("[shim] start: decode FAILED");
-            return (StatusCode::BAD_REQUEST, "decode failed").into_response();
-        }
+        None => return (StatusCode::BAD_REQUEST, "decode failed").into_response(),
     };
-    eprintln!(
-        "[shim] start: decoded process={:?}",
-        req.process.as_ref().map(|p| (&p.cmd, &p.args))
-    );
-
     let proc_cfg = req.process.unwrap_or_default();
-    // Figure out which template to dispatch to. For Phase 1 MVP we use the env var
-    // ENVD_TEMPLATE if set, else "default". A future revision will route by sandbox_id
-    // (header or path) so each sandbox is sticky to its template.
-    let template = std::env::var("E2B_SHIM_DEFAULT_TEMPLATE").unwrap_or_else(|_| "default".into());
-
-    let mut args_combined = vec![proc_cfg.cmd.clone()];
-    args_combined.extend(proc_cfg.args.clone());
-    let envs = proc_cfg.envs.clone();
-    let cwd = proc_cfg.cwd.clone();
-
-    // Resolve sandbox + its host fs dir; serialize fs into files= map and set cwd to /workspace.
     let sid = pick_sandbox_id(&state, &headers).ok();
-    // Enforce paused state — reject commands on a paused sandbox without
-    // touching the underlying worker container (the pool is shared).
     if let Some(s_ref) = sid.as_ref() {
         if let Some(rec) = state.sandboxes.get(s_ref) {
             if rec.state == "paused" {
@@ -851,167 +660,15 @@ async fn process_start(
             }
         }
     }
-
-    // Tools backend short-circuit: skip the Python-subprocess wrapper and
-    // forward straight to /v2/sessions/:sid/tools/bash. The cmd + args are
-    // joined into a single shell line (caller's responsibility to quote).
-    let backend = sid
-        .as_ref()
-        .and_then(|s| state.sandboxes.get(s).map(|r| r.backend.clone()))
-        .unwrap_or_else(default_backend);
-    if backend == "tools" {
-        let bash_cmd = if proc_cfg.args.is_empty() {
-            proc_cfg.cmd.clone()
-        } else {
-            format!("{} {}", proc_cfg.cmd, proc_cfg.args.join(" "))
-        };
-        return process_start_tools(state, codec, sid, bash_cmd).await;
-    }
-    let sandbox_files: std::collections::HashMap<String, String> = match &sid {
-        Some(s) => {
-            let root = sandbox_fs_dir(s);
-            let _ = std::fs::create_dir_all(&root);
-            collect_files(&root)
-        }
-        None => Default::default(),
+    // Tools backend (the only backend now): forward to /v2/.../tools/bash.
+    // cmd + args joined into a single shell line — caller's responsibility
+    // to quote.
+    let bash_cmd = if proc_cfg.args.is_empty() {
+        proc_cfg.cmd.clone()
+    } else {
+        format!("{} {}", proc_cfg.cmd, proc_cfg.args.join(" "))
     };
-    let effective_cwd = cwd.or(Some(".".to_string()));
-    let py_code = build_python_subprocess(args_combined, envs, effective_cwd);
-
-    // (flags, sender) -> stream Body
-    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
-
-    // Send StartEvent (fake pid).
-    let encode_resp = move |r: &pb::StartResponse| enc_resp(r, codec);
-    let start_evt = pb::StartResponse {
-        event: Some(pb::ProcessEvent {
-            event: Some(ProcessEventOneof::Start(StartEvent { pid: 1 })),
-        }),
-    };
-    let _ = tx.send(Ok(encode_resp(&start_evt))).await;
-
-    // Run upstream in a task; pipe its result back as DataEvent + EndEvent.
-    let upstream = state.upstream.clone();
-    let http = state.http.clone();
-    let tx2 = tx.clone();
-    let codec_for_task = codec;
-    let sandbox_files_clone = sandbox_files.clone();
-    let sid_owned: Option<String> = sid.clone();
-    let _ = sandbox_files;
-    tokio::spawn(async move {
-        let sandbox_files = sandbox_files_clone;
-        let body = serde_json::json!({
-            "template": template,
-            "code": py_code,
-            "timeout": 60,
-            "files": sandbox_files,
-            "persist_changes": true,
-        });
-        let resp = http
-            .post(format!("{}/exec_hot", upstream))
-            .json(&body)
-            .timeout(Duration::from_secs(120))
-            .send()
-            .await;
-        match resp {
-            Ok(r) => {
-                let result: Result<UpstreamExecResp, _> = r.json().await;
-                match result {
-                    Ok(u) => {
-                        // Persist file changes back to host fs dir.
-                        if let Some(sid_clone) = sid_owned.as_ref() {
-                            let root = sandbox_fs_dir(sid_clone);
-                            for (rel, content) in u.output_files.iter() {
-                                let full = root.join(rel);
-                                if let Some(parent) = full.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                let _ = std::fs::write(&full, content.as_bytes());
-                            }
-                            for (rel, b64) in u.output_files_b64.iter() {
-                                let full = root.join(rel);
-                                if let Some(parent) = full.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                if let Some(bin) = general_b64_decode(b64) {
-                                    let _ = std::fs::write(&full, bin);
-                                }
-                            }
-                            for rel in u.deleted_files.iter() {
-                                let full = root.join(rel);
-                                let _ = std::fs::remove_file(&full);
-                            }
-                        }
-                        if !u.stdout.is_empty() {
-                            let evt = pb::StartResponse {
-                                event: Some(pb::ProcessEvent {
-                                    event: Some(ProcessEventOneof::Data(DataEvent {
-                                        output: Some(data_event::Output::Stdout(
-                                            u.stdout.into_bytes(),
-                                        )),
-                                    })),
-                                }),
-                            };
-                            let _ = tx2.send(Ok(enc_resp(&evt, codec_for_task))).await;
-                        }
-                        if !u.stderr.is_empty() {
-                            let evt = pb::StartResponse {
-                                event: Some(pb::ProcessEvent {
-                                    event: Some(ProcessEventOneof::Data(DataEvent {
-                                        output: Some(data_event::Output::Stderr(
-                                            u.stderr.into_bytes(),
-                                        )),
-                                    })),
-                                }),
-                            };
-                            let _ = tx2.send(Ok(enc_resp(&evt, codec_for_task))).await;
-                        }
-                        let evt = pb::StartResponse {
-                            event: Some(pb::ProcessEvent {
-                                event: Some(ProcessEventOneof::End(EndEvent {
-                                    exit_code: u.exit_code,
-                                    exited: true,
-                                    status: format!("exit {}", u.exit_code),
-                                    error: None,
-                                })),
-                            }),
-                        };
-                        let _ = tx2.send(Ok(enc_resp(&evt, codec_for_task))).await;
-                        let _ = tx2.send(Ok(end_envelope_ok())).await;
-                    }
-                    Err(e) => {
-                        let _ = tx2
-                            .send(Ok(end_envelope_err(
-                                "internal",
-                                &format!("upstream json: {}", e),
-                            )))
-                            .await;
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = tx2
-                    .send(Ok(end_envelope_err(
-                        "unavailable",
-                        &format!("upstream send: {}", e),
-                    )))
-                    .await;
-            }
-        }
-    });
-
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body = Body::from_stream(stream);
-    let ct_out = match codec {
-        Codec::Proto => "application/connect+proto",
-        Codec::Json => "application/connect+json",
-    };
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, ct_out)
-        .header("connect-protocol-version", "1")
-        .body(body)
-        .unwrap()
+    process_start_tools(state, codec, sid, bash_cmd).await
 }
 
 /// Tools-backend variant of process_start: forward to upstream's
@@ -1236,6 +893,7 @@ fn resolve_path(
 // ---- proto-JSON ↔ Rust dispatch helpers --------------------------------
 
 #[derive(serde::Deserialize, Default)]
+#[allow(dead_code)]
 struct JsonPathRequest {
     #[serde(default)]
     path: String,
@@ -1271,37 +929,6 @@ fn decode_unary_path_request(ct: &str, body: &[u8]) -> Option<JsonPathRequest> {
     }
 }
 
-fn make_entry_info_json(path: &std::path::Path, root: &std::path::Path) -> serde_json::Value {
-    use serde_json::json;
-    let meta = std::fs::symlink_metadata(path).ok();
-    let (size, mode, ftype) = match &meta {
-        Some(m) => {
-            use std::os::unix::fs::PermissionsExt;
-            let ft = if m.is_dir() {
-                2
-            } else if m.is_file() {
-                1
-            } else {
-                0
-            };
-            (m.len() as i64, m.permissions().mode(), ft)
-        }
-        None => (0i64, 0u32, 0),
-    };
-    // Present paths to the SDK relative to the sandbox root, prefixed with '/'.
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    let mut shown = String::from("/");
-    shown.push_str(&rel.to_string_lossy());
-    json!({
-        "name": path.file_name().map(|f| f.to_string_lossy()).unwrap_or_default(),
-        "type": ftype,
-        "path": shown,
-        "size": size,
-        "mode": mode,
-        "permissions": format!("{:o}", mode & 0o777),
-    })
-}
-
 fn unary_json_response(ct: &str, value: serde_json::Value) -> Response {
     let codec = codec_from_content_type(ct);
     let body = match codec {
@@ -1325,105 +952,28 @@ fn unary_json_response(ct: &str, value: serde_json::Value) -> Response {
         .unwrap()
 }
 
-async fn fs_stat(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Ok(sid) = pick_sandbox_id(&state, &headers) {
-        if sandbox_backend(&state, &sid) == "tools" {
-            return tools_not_implemented("stat");
-        }
-    }
-    let ct = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let req = match decode_unary_path_request(ct, &body) {
-        Some(r) => r,
-        None => return (StatusCode::BAD_REQUEST, "decode").into_response(),
-    };
-    let path = match resolve_path(&state, &headers, &req.path) {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
-    };
-    if !path.exists() {
-        let ct_out = if ct.contains("json") {
-            "application/json"
-        } else {
-            "application/proto"
-        };
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, ct_out)
-            .body(Body::from(
-                r#"{"code":"not_found","message":"path not found"}"#,
-            ))
-            .unwrap();
-    }
-    let sid_for_root = pick_sandbox_id(&state, &headers).unwrap_or_default();
-    let root = sandbox_fs_dir(&sid_for_root);
-    unary_json_response(
-        ct,
-        serde_json::json!({"entry": make_entry_info_json(&path, &root)}),
-    )
+async fn fs_stat(
+    State(_state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    _body: Bytes,
+) -> Response {
+    tools_not_implemented("stat")
 }
 
-async fn fs_mkdir(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Ok(sid) = pick_sandbox_id(&state, &headers) {
-        if sandbox_backend(&state, &sid) == "tools" {
-            return tools_not_implemented("mkdir");
-        }
-    }
-    let ct = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let req = match decode_unary_path_request(ct, &body) {
-        Some(r) => r,
-        None => return (StatusCode::BAD_REQUEST, "decode").into_response(),
-    };
-    let path = match resolve_path(&state, &headers, &req.path) {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = std::fs::create_dir_all(&path) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {}", e)).into_response();
-    }
-    let sid_for_root = pick_sandbox_id(&state, &headers).unwrap_or_default();
-    let root = sandbox_fs_dir(&sid_for_root);
-    unary_json_response(
-        ct,
-        serde_json::json!({"entry": make_entry_info_json(&path, &root)}),
-    )
+async fn fs_mkdir(
+    State(_state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    _body: Bytes,
+) -> Response {
+    tools_not_implemented("mkdir")
 }
 
-async fn fs_list(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Ok(sid) = pick_sandbox_id(&state, &headers) {
-        if sandbox_backend(&state, &sid) == "tools" {
-            return tools_not_implemented("list");
-        }
-    }
-    let ct = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let req = match decode_unary_path_request(ct, &body) {
-        Some(r) => r,
-        None => return (StatusCode::BAD_REQUEST, "decode").into_response(),
-    };
-    let path = match resolve_path(&state, &headers, &req.path) {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
-    };
-    let sid = match pick_sandbox_id(&state, &headers) {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let root = sandbox_fs_dir(&sid);
-    let mut entries = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&path) {
-        for e in rd.flatten() {
-            entries.push(make_entry_info_json(&e.path(), &root));
-        }
-    }
-    unary_json_response(ct, serde_json::json!({"entries": entries}))
+async fn fs_list(
+    State(_state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    _body: Bytes,
+) -> Response {
+    tools_not_implemented("list")
 }
 
 async fn fs_remove(
@@ -1451,40 +1001,12 @@ async fn fs_remove(
     unary_json_response(ct, serde_json::json!({}))
 }
 
-async fn fs_move(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Ok(sid) = pick_sandbox_id(&state, &headers) {
-        if sandbox_backend(&state, &sid) == "tools" {
-            return tools_not_implemented("move");
-        }
-    }
-    let ct = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let req = match decode_unary_path_request(ct, &body) {
-        Some(r) => r,
-        None => return (StatusCode::BAD_REQUEST, "decode").into_response(),
-    };
-    let src = match resolve_path(&state, &headers, &req.source) {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
-    };
-    let dst = match resolve_path(&state, &headers, &req.destination) {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
-    };
-    if let Some(parent) = dst.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(e) = std::fs::rename(&src, &dst) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("move: {}", e)).into_response();
-    }
-    let sid_for_root = pick_sandbox_id(&state, &headers).unwrap_or_default();
-    let root = sandbox_fs_dir(&sid_for_root);
-    unary_json_response(
-        ct,
-        serde_json::json!({"entry": make_entry_info_json(&dst, &root)}),
-    )
+async fn fs_move(
+    State(_state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    _body: Bytes,
+) -> Response {
+    tools_not_implemented("move")
 }
 
 // ---- /files (HTTP path-based read/write) -------------------------------
@@ -1505,7 +1027,7 @@ async fn files_get(
 ) -> Response {
     // Tools backend: forward to tools-rust /read via api-rust /v2.
     if let Ok(sid) = pick_sandbox_id(&state, &headers) {
-        if sandbox_backend(&state, &sid) == "tools" {
+        if true {
             let rel = tools_relative_path(&q.path);
             return match forward_tools_tool(
                 &state,
@@ -1566,7 +1088,7 @@ async fn files_post(
         body.to_vec()
     };
     if let Ok(sid) = pick_sandbox_id(&state, &headers) {
-        if sandbox_backend(&state, &sid) == "tools" {
+        if true {
             let content = match String::from_utf8(payload_for_tools.clone()) {
                 Ok(s) => s,
                 Err(_) => {
@@ -2842,82 +2364,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn general_b64_decode(s: &str) -> Option<Vec<u8>> {
-    // Inverse of general_b64.
-    let mut tbl = [255u8; 256];
-    for (i, c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-        .iter()
-        .enumerate()
-    {
-        tbl[*c as usize] = i as u8;
-    }
-    let bytes: Vec<u8> = s
-        .bytes()
-        .filter(|b| *b != b'\n' && *b != b'\r' && *b != b' ')
-        .collect();
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    let mut buf = 0u32;
-    let mut bits = 0u32;
-    for b in bytes.iter() {
-        if *b == b'=' {
-            break;
-        }
-        let v = tbl[*b as usize];
-        if v == 255 {
-            return None;
-        }
-        buf = (buf << 6) | (v as u32);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // ---- base64 ---------------------------------------------------------
-
-    #[test]
-    fn b64_empty() {
-        assert_eq!(general_b64(&[]), "");
-        assert_eq!(general_b64_decode("").unwrap(), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn b64_hello_fixture() {
-        assert_eq!(general_b64(b"hello"), "aGVsbG8=");
-        assert_eq!(general_b64_decode("aGVsbG8=").unwrap(), b"hello".to_vec());
-    }
-
-    #[test]
-    fn b64_padding_lengths() {
-        // 1-byte payload → 2 chars + 2 pad
-        assert_eq!(general_b64(&[0xff]), "/w==");
-        // 2-byte payload → 3 chars + 1 pad
-        assert_eq!(general_b64(&[0xff, 0xff]), "//8=");
-        // 3-byte payload → 4 chars + 0 pad
-        assert_eq!(general_b64(&[0xff, 0xff, 0xff]), "////");
-    }
-
-    #[test]
-    fn b64_all_bytes_roundtrip() {
-        let v: Vec<u8> = (0..=255u8).collect();
-        let s = general_b64(&v);
-        let back = general_b64_decode(&s).unwrap();
-        assert_eq!(v, back);
-    }
-
-    #[test]
-    fn b64_decode_rejects_invalid() {
-        // '!' is not in the alphabet.
-        assert!(general_b64_decode("aGVsbG8!").is_none());
-    }
 
     // ---- urlencoding ---------------------------------------------------
 
@@ -3080,7 +2531,6 @@ mod tests {
             memory_mb: 1024,
             disk_size_mb: 4096,
             state: "running".into(),
-            backend: default_backend(),
         };
         let json = serde_json::to_string(&rec).unwrap();
         // Field names are renamed to camelCase E2B-style.
@@ -3090,42 +2540,5 @@ mod tests {
         assert_eq!(back.sandbox_id, "i123");
         assert_eq!(back.cpu_count, 2);
         assert_eq!(back.state, "running");
-        assert_eq!(back.backend, "python-pool");
-    }
-
-    #[test]
-    fn is_tools_template_matches_prefix() {
-        assert!(is_tools_template("tools"));
-        assert!(is_tools_template("tools-default"));
-        assert!(is_tools_template("tools-python-dev"));
-        assert!(!is_tools_template("default"));
-        assert!(!is_tools_template("data-science"));
-        assert!(!is_tools_template(""));
-    }
-
-    #[test]
-    fn default_backend_is_python_pool() {
-        assert_eq!(default_backend(), "python-pool");
-    }
-
-    #[test]
-    fn sandbox_rec_omits_backend_in_legacy_json() {
-        // A stored record from before the backend field existed must still
-        // deserialize (no backend → default_backend).
-        let legacy = r#"{
-            "sandboxID":"i999",
-            "templateID":"default",
-            "clientID":"shim",
-            "domain":null,
-            "envdVersion":"0.5.0",
-            "envdAccessToken":null,
-            "alias":null,
-            "metadata":null,
-            "startedAt":"2026-01-01T00:00:00Z",
-            "endAt":"2026-01-01T01:00:00Z",
-            "state":"running"
-        }"#;
-        let rec: SandboxRec = serde_json::from_str(legacy).unwrap();
-        assert_eq!(rec.backend, "python-pool");
     }
 }
