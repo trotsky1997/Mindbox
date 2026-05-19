@@ -222,7 +222,10 @@ def _run_sandbox_pb(job_bytes):
     files = dict(job.files)
     persist = bool(getattr(job, 'persist_changes', False))
 
-    saved_cwd = os.getcwd() if (files or persist) else None
+    # Always snapshot cwd: each request runs inside a fresh tmpdir so user
+    # code can't see (or accidentally clobber) sibling requests' relative
+    # writes when sharing one worker child.
+    saved_cwd = os.getcwd()
     saved_env = dict(os.environ) if env else None
     fds_before = _count_fds()
 
@@ -234,9 +237,10 @@ def _run_sandbox_pb(job_bytes):
     _persist_out = ({}, [], {})
     exec_start = time.monotonic_ns()
     try:
-        # Fast path: no files and no persist → skip tmpdir creation entirely.
-        if files or persist:
-            run_dir = Path(tempfile.mkdtemp(prefix='run-'))
+        # Per-request tmpdir + chdir, always — gives each request a fresh
+        # cwd so it can't clobber sibling requests' relative writes.
+        run_dir = Path(tempfile.mkdtemp(prefix='run-'))
+        if files:
             run_root = run_dir.resolve()
             for rel, content in files.items():
                 target = (run_dir / rel).resolve()
@@ -244,7 +248,7 @@ def _run_sandbox_pb(job_bytes):
                     raise ValueError('invalid path: ' + rel)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content)
-            os.chdir(run_dir)
+        os.chdir(run_dir)
         # snapshot before exec: rel_path -> (mtime_ns, size)
         _initial = _snapshot_dir(run_dir) if persist else {}
         if env:

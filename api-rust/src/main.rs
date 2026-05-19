@@ -706,6 +706,15 @@ async fn start_template_container(
 
     let net_mode = std::env::var("WORKER_NETWORK_MODE").unwrap_or_else(|_| "none".into());
 
+    // Mount /tmp (and /var/tmp) as tmpfs so sandbox_helper's per-request
+    // mkdtemp + Python stdlib temp writes have a writable path while the
+    // rest of the rootfs stays read-only.
+    let tmpfs_size = std::env::var("WORKER_TMPFS_SIZE").unwrap_or_else(|_| "1g".into());
+    let tmpfs = std::collections::HashMap::from([
+        ("/tmp".to_string(), format!("size={}", tmpfs_size)),
+        ("/var/tmp".to_string(), format!("size={}", tmpfs_size)),
+    ]);
+
     let config = bollard::container::Config::<String> {
         image: Some(tag),
         labels: Some(labels),
@@ -718,6 +727,13 @@ async fn start_template_container(
             oom_score_adj: Some(500),
             security_opt: Some(vec!["no-new-privileges".into()]),
             network_mode: Some(net_mode),
+            // Read-only container rootfs blocks user code from writing
+            // to / clobbering anything in the worker image; sibling
+            // requests on the same child can't see each other's
+            // container-fs writes. Tmpfs above carves out /tmp for the
+            // per-request mkdtemp + general Python temp use.
+            readonly_rootfs: Some(true),
+            tmpfs: Some(tmpfs),
             ..Default::default()
         }),
         ..Default::default()
