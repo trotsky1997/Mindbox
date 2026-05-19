@@ -96,6 +96,7 @@ dependencies = [
  "nix",
  "prost",
  "prost-build",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

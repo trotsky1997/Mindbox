@@ -1,5 +1,7 @@
 // api-rust v0.3: protobuf over unix socket between api and worker containers.
 
+mod tools_forward;
+
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::State,
@@ -1500,6 +1502,16 @@ async fn main() -> Result<()> {
         max_timeout,
     });
 
+    let tools_state = std::sync::Arc::new(tools_forward::ToolsForwardState::from_env());
+    if let Some(u) = tools_state.upstream.as_deref() {
+        eprintln!("[api] tools forward upstream = {}", u);
+    } else {
+        eprintln!(
+            "[api] TOOLS_DAEMON_URL unset; /v2/* routes will respond 503 (set it to enable forward)"
+        );
+    }
+    let tools_router = tools_forward::router(tools_state);
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/templates", get(list_templates))
@@ -1509,7 +1521,8 @@ async fn main() -> Result<()> {
         .route("/admin/build/:name", post(admin_build))
         .route("/exec_hot", post(exec_hot))
         .route("/exec", post(exec_cold))
-        .with_state(state);
+        .with_state(state)
+        .merge(tools_router);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = {
