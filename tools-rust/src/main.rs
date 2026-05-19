@@ -38,6 +38,7 @@ pub struct AppState {
     sandbox_root: PathBuf,
     sessions: DashMap<String, PathBuf>,
     isolation: IsolationCfg,
+    seccomp_filter: Option<Arc<seccompiler::BpfProgram>>,
 }
 
 /// Which optional isolation layers to apply on bash subprocess spawn.
@@ -152,6 +153,69 @@ fn cleanup_session_cgroup(cgroup_dir: &std::path::Path) {
 ",
     );
     let _ = std::fs::remove_dir(cgroup_dir);
+}
+
+/// Build a seccomp filter for bash subprocesses: default-allow with an
+/// explicit denylist of privilege-escalation / namespace / out-of-band-IO
+/// syscalls. A default-deny allowlist is safer but too brittle for general
+/// bash workloads — any uncommon syscall would break random user code.
+fn build_seccomp_filter() -> anyhow::Result<seccompiler::BpfProgram> {
+    use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
+    let denied: &[i64] = &[
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_setuid,
+        libc::SYS_setgid,
+        libc::SYS_setresuid,
+        libc::SYS_setresgid,
+        libc::SYS_setreuid,
+        libc::SYS_setregid,
+        libc::SYS_capset,
+        libc::SYS_ptrace,
+        libc::SYS_personality,
+        libc::SYS_keyctl,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_reboot,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_kexec_load,
+        libc::SYS_chroot,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_userfaultfd,
+        libc::SYS_unshare,
+    ];
+    let mut rules: std::collections::BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
+        std::collections::BTreeMap::new();
+    for syscall in denied {
+        rules.insert(*syscall, vec![]); // no arg-match → all calls of this syscall
+    }
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,                     // default = allow
+        SeccompAction::Errno(libc::EPERM as u32), // denylist returns -EPERM
+        TargetArch::x86_64,
+    )?;
+    Ok(filter.try_into()?)
+}
+
+/// Apply PR_SET_NO_NEW_PRIVS and the prebuilt seccomp filter to the
+/// current process. Called from inside a tokio::process::Command pre_exec
+/// hook (post-fork, pre-exec).
+///
+/// # Safety
+/// Caller must invoke only between fork and exec. seccompiler's apply_filter
+/// and prctl on the post-fork path are async-signal-safe.
+unsafe fn apply_bash_isolation(filter: &seccompiler::BpfProgram) -> std::io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    seccompiler::apply_filter(filter)
+        .map_err(|e| std::io::Error::other(format!("apply_filter: {e}")))?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -623,6 +687,14 @@ async fn tool_bash(
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
+    if let Some(filter) = state.seccomp_filter.clone() {
+        // SAFETY: pre_exec runs post-fork, pre-exec — apply_bash_isolation
+        // only does prctl(PR_SET_NO_NEW_PRIVS) and seccompiler::apply_filter,
+        // both async-signal-safe per their docs.
+        unsafe {
+            cmd.pre_exec(move || apply_bash_isolation(&filter));
+        }
+    }
     let timeout = Duration::from_secs(req.timeout.clamp(1, 300));
     let cgroup_dir = state
         .isolation
@@ -691,10 +763,25 @@ fn make_state() -> anyhow::Result<Arc<AppState>> {
         isolation.cgroup,
         isolation.cgroup_root,
     );
+    let seccomp_filter = if isolation.seccomp {
+        match build_seccomp_filter() {
+            Ok(f) => {
+                tracing::info!("seccomp filter built ({} BPF insns)", f.len());
+                Some(Arc::new(f))
+            }
+            Err(e) => {
+                tracing::warn!("seccomp requested but build failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
     Ok(Arc::new(AppState {
         sandbox_root,
         sessions: DashMap::new(),
         isolation,
+        seccomp_filter,
     }))
 }
 
@@ -734,6 +821,7 @@ mod tests {
             sandbox_root: td.path().to_path_buf(),
             sessions: DashMap::new(),
             isolation: IsolationCfg::default(),
+            seccomp_filter: None,
         });
         (td, state)
     }
@@ -897,6 +985,16 @@ mod tests {
         // We can't pretend to be on a host with cgroup v2 in unit tests;
         // exercise the function and assert it doesn't panic.
         let _ = detect_cgroup_v2();
+    }
+
+    #[test]
+    fn build_seccomp_filter_succeeds() {
+        let f = build_seccomp_filter().expect("seccomp filter should build");
+        assert!(
+            f.len() > 4,
+            "filter is suspiciously small: {} insns",
+            f.len()
+        );
     }
 
     async fn make_sid(state: &Arc<AppState>, name: &str) -> String {
