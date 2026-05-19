@@ -52,8 +52,13 @@ jobs:
       # bind-mounted, and let template-build emit the template image to
       # the host docker daemon. Then re-tag for ghcr and push.
 
+      - name: Compute lowercase image base
+        id: img
+        run: |
+          echo "base=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - name: Pull mindbox image back as template builder
-        run: docker pull ghcr.io/${{ github.repository }}:latest
+        run: docker pull ${{ steps.img.outputs.base }}:latest
 
       - name: Build tools-default template image
         run: |
@@ -62,7 +67,7 @@ jobs:
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v ${{ github.workspace }}/templates:/opt/inspect-api/templates:ro \
             --entrypoint /usr/local/bin/template-build \
-            ghcr.io/${{ github.repository }}:latest \
+            ${{ steps.img.outputs.base }}:latest \
             tools-default
           # Sanity-check the image exists locally.
           docker images inspect-tpl-tools-tools-default --format \
@@ -72,7 +77,7 @@ jobs:
         run: |
           set -e
           SHA=${GITHUB_SHA::7}
-          TPL=ghcr.io/${{ github.repository }}/tpl-tools-default
+          TPL=${{ steps.img.outputs.base }}/tpl-tools-default
           docker tag inspect-tpl-tools-tools-default:latest "$TPL:latest"
           docker tag inspect-tpl-tools-tools-default:latest "$TPL:$SHA"
           docker push "$TPL:latest"
