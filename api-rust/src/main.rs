@@ -1124,3 +1124,183 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixStream as TokioUnixStream;
+
+    // ---- parse_memory --------------------------------------------------
+
+    #[test]
+    fn parse_memory_units() {
+        assert_eq!(parse_memory("4g").unwrap(), 4 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory("4GB").unwrap(), 4 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory("1024m").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory("512mb").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory("2048k").unwrap(), 2048 * 1024);
+        assert_eq!(parse_memory("1024").unwrap(), 1024);
+        assert_eq!(parse_memory(" 2g ").unwrap(), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_rejects_garbage() {
+        assert!(parse_memory("abc").is_err());
+        assert!(parse_memory("").is_err());
+    }
+
+    // ---- send_frame / recv_frame ---------------------------------------
+    //
+    // 4-byte u32 BE length prefix + payload. MAX_FRAME = 64 MiB.
+
+    #[tokio::test]
+    async fn frame_roundtrip_empty() {
+        let (mut a, mut b) = TokioUnixStream::pair().unwrap();
+        send_frame(&mut a, b"").await.unwrap();
+        let got = recv_frame(&mut b).await.unwrap();
+        assert_eq!(got, Vec::<u8>::new());
+    }
+
+    #[tokio::test]
+    async fn frame_roundtrip_1k() {
+        let payload = vec![0xABu8; 1024];
+        let (mut a, mut b) = TokioUnixStream::pair().unwrap();
+        send_frame(&mut a, &payload).await.unwrap();
+        let got = recv_frame(&mut b).await.unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn frame_recv_rejects_oversize_header() {
+        // Manually craft a frame whose header claims > MAX_FRAME.
+        let (mut a, mut b) = TokioUnixStream::pair().unwrap();
+        use tokio::io::AsyncWriteExt;
+        let oversize = (MAX_FRAME as u32 + 1).to_be_bytes();
+        a.write_all(&oversize).await.unwrap();
+        // Close to make the receiver fail fast.
+        drop(a);
+        let err = recv_frame(&mut b).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn frame_recv_eof_on_truncated_payload() {
+        let (mut a, mut b) = TokioUnixStream::pair().unwrap();
+        use tokio::io::AsyncWriteExt;
+        // Header says 100 bytes follow but we only send 5.
+        a.write_all(&100u32.to_be_bytes()).await.unwrap();
+        a.write_all(b"short").await.unwrap();
+        drop(a);
+        let err = recv_frame(&mut b).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    // ---- RegistryState LRU --------------------------------------------
+
+    fn empty_state() -> RegistryState {
+        RegistryState { runtimes: HashMap::new(), lru: VecDeque::new() }
+    }
+
+    #[test]
+    fn touch_lru_appends_new_name() {
+        let mut s = empty_state();
+        PagedRegistry::touch_lru_locked(&mut s, "a");
+        PagedRegistry::touch_lru_locked(&mut s, "b");
+        PagedRegistry::touch_lru_locked(&mut s, "c");
+        let order: Vec<_> = s.lru.iter().cloned().collect();
+        assert_eq!(order, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn touch_lru_moves_existing_to_back() {
+        let mut s = empty_state();
+        PagedRegistry::touch_lru_locked(&mut s, "a");
+        PagedRegistry::touch_lru_locked(&mut s, "b");
+        PagedRegistry::touch_lru_locked(&mut s, "c");
+        PagedRegistry::touch_lru_locked(&mut s, "a"); // bump
+        let order: Vec<_> = s.lru.iter().cloned().collect();
+        assert_eq!(order, vec!["b", "c", "a"]);
+    }
+
+    #[test]
+    fn touch_lru_idempotent_single_name() {
+        let mut s = empty_state();
+        for _ in 0..5 { PagedRegistry::touch_lru_locked(&mut s, "x"); }
+        assert_eq!(s.lru.len(), 1);
+        assert_eq!(s.lru.front().unwrap(), "x");
+    }
+
+    // ---- load_templates ------------------------------------------------
+
+    #[test]
+    fn load_templates_empty_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = load_templates(dir.path()).unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn load_templates_reads_valid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("hello");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("template.toml"),
+            "name = \"hello\"\npool_size = 8\ncontainers = 2\n").unwrap();
+        let v = load_templates(dir.path()).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "hello");
+        assert_eq!(v[0].pool_size, 8);
+        assert_eq!(v[0].containers, 2);
+    }
+
+    #[test]
+    fn load_templates_skips_dirs_without_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("no-toml-here")).unwrap();
+        let v = load_templates(dir.path()).unwrap();
+        assert!(v.is_empty());
+    }
+
+    // ---- pb::Request / Response round-trip ----------------------------
+
+    #[test]
+    fn pb_request_roundtrip() {
+        let req = pb::Request {
+            cmd: "lease".into(),
+            lease_count: 8,
+            job: Some(pb::Job {
+                code: "print(1)".into(),
+                timeout: 30,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = req.encode_to_vec();
+        let decoded = pb::Request::decode(&*bytes).unwrap();
+        assert_eq!(decoded.cmd, "lease");
+        assert_eq!(decoded.lease_count, 8);
+        assert_eq!(decoded.job.as_ref().unwrap().timeout, 30);
+    }
+
+    #[test]
+    fn pb_response_roundtrip() {
+        let resp = pb::Response {
+            kind: "exec".into(),
+            exec: Some(pb::ExecResult {
+                stdout: "hi".into(),
+                stderr: "".into(),
+                exit_code: 0,
+                elapsed_ms: 42,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = resp.encode_to_vec();
+        let decoded = pb::Response::decode(&*bytes).unwrap();
+        assert_eq!(decoded.kind, "exec");
+        let e = decoded.exec.unwrap();
+        assert_eq!(e.stdout, "hi");
+        assert_eq!(e.exit_code, 0);
+        assert_eq!(e.elapsed_ms, 42);
+    }
+}

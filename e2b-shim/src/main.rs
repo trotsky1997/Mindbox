@@ -2032,3 +2032,206 @@ fn general_b64_decode(s: &str) -> Option<Vec<u8>> {
     }
     Some(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- base64 ---------------------------------------------------------
+
+    #[test]
+    fn b64_empty() {
+        assert_eq!(general_b64(&[]), "");
+        assert_eq!(general_b64_decode("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn b64_hello_fixture() {
+        assert_eq!(general_b64(b"hello"), "aGVsbG8=");
+        assert_eq!(general_b64_decode("aGVsbG8=").unwrap(), b"hello".to_vec());
+    }
+
+    #[test]
+    fn b64_padding_lengths() {
+        // 1-byte payload → 2 chars + 2 pad
+        assert_eq!(general_b64(&[0xff]), "/w==");
+        // 2-byte payload → 3 chars + 1 pad
+        assert_eq!(general_b64(&[0xff, 0xff]), "//8=");
+        // 3-byte payload → 4 chars + 0 pad
+        assert_eq!(general_b64(&[0xff, 0xff, 0xff]), "////");
+    }
+
+    #[test]
+    fn b64_all_bytes_roundtrip() {
+        let v: Vec<u8> = (0..=255u8).collect();
+        let s = general_b64(&v);
+        let back = general_b64_decode(&s).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn b64_decode_rejects_invalid() {
+        // '!' is not in the alphabet.
+        assert!(general_b64_decode("aGVsbG8!").is_none());
+    }
+
+    // ---- urlencoding ---------------------------------------------------
+
+    #[test]
+    fn urlenc_unreserved_passthrough() {
+        for s in &["abc", "ABC", "0123", "a.b-c_d~e"] {
+            assert_eq!(urlencoding_encode(s), *s);
+            assert_eq!(urlencoding_decode(s).unwrap(), *s);
+        }
+    }
+
+    #[test]
+    fn urlenc_special_chars() {
+        assert_eq!(urlencoding_encode(" "), "%20");
+        assert_eq!(urlencoding_encode("/"), "%2F");
+        assert_eq!(urlencoding_decode("%20").unwrap(), " ");
+        assert_eq!(urlencoding_decode("%2F").unwrap(), "/");
+    }
+
+    #[test]
+    fn urlenc_utf8() {
+        // "中" = U+4E2D = 0xE4 0xB8 0xAD
+        assert_eq!(urlencoding_encode("中"), "%E4%B8%AD");
+        assert_eq!(urlencoding_decode("%E4%B8%AD").unwrap(), "中");
+    }
+
+    #[test]
+    fn urlenc_token_roundtrip() {
+        let tok = "b00000000000000000001:abcd1234";
+        let enc = urlencoding_encode(tok);
+        assert_eq!(urlencoding_decode(&enc).unwrap(), tok);
+    }
+
+    #[test]
+    fn urlenc_decode_truncated_percent_passthrough() {
+        // Implementation is lenient: a truncated %X at end of string is treated
+        // as literal characters rather than rejected. Document the contract.
+        assert_eq!(urlencoding_decode("%E").unwrap(), "%E");
+        assert_eq!(urlencoding_decode("%").unwrap(), "%");
+        // But an invalid hex pair in mid-string IS rejected:
+        assert!(urlencoding_decode("%XYabc").is_none());
+    }
+
+    // ---- Connect envelope ----------------------------------------------
+
+    #[test]
+    fn envelope_layout() {
+        let env = envelope(0x00, b"hi");
+        // 1 byte flags + 4 byte BE u32 length + 2 byte payload.
+        assert_eq!(env.len(), 7);
+        assert_eq!(env[0], 0x00);
+        assert_eq!(&env[1..5], &2u32.to_be_bytes());
+        assert_eq!(&env[5..7], b"hi");
+    }
+
+    #[test]
+    fn extract_body_connect_unwraps_envelope() {
+        let env = envelope(0x00, b"hi");
+        let got = extract_body("application/connect+proto", &env).unwrap();
+        assert_eq!(got, b"hi");
+    }
+
+    #[test]
+    fn extract_body_unary_passthrough() {
+        let raw = b"raw bytes";
+        let got = extract_body("application/proto", raw).unwrap();
+        assert_eq!(got, raw);
+    }
+
+    #[test]
+    fn extract_body_rejects_short_connect_envelope() {
+        // Connect needs at least 5 bytes of header.
+        assert!(extract_body("application/connect+proto", &[0u8; 3]).is_none());
+    }
+
+    #[test]
+    fn extract_body_rejects_truncated_payload() {
+        // Header claims 100 byte payload, only 5 bytes follow.
+        let mut buf = vec![0u8];
+        buf.extend_from_slice(&100u32.to_be_bytes());
+        buf.extend_from_slice(b"short");
+        assert!(extract_body("application/connect+json", &buf).is_none());
+    }
+
+    // ---- codec_from_content_type ---------------------------------------
+
+    #[test]
+    fn codec_dispatch() {
+        assert!(matches!(codec_from_content_type("application/json"), Codec::Json));
+        assert!(matches!(codec_from_content_type("application/connect+json"), Codec::Json));
+        assert!(matches!(codec_from_content_type("application/proto"), Codec::Proto));
+        assert!(matches!(codec_from_content_type("application/connect+proto"), Codec::Proto));
+        assert!(matches!(codec_from_content_type(""), Codec::Proto));
+    }
+
+    // ---- sanitize_name -------------------------------------------------
+
+    #[test]
+    fn sanitize_strips_tag() {
+        assert_eq!(sanitize_name("my-img:latest"), "my-img");
+        assert_eq!(sanitize_name("name:v1.0:extra"), "name");
+    }
+
+    #[test]
+    fn sanitize_filters_charset() {
+        assert_eq!(sanitize_name("a/b\\c"), "abc");
+        assert_eq!(sanitize_name("ok_name.v2-final"), "ok_name.v2-final");
+    }
+
+    #[test]
+    fn sanitize_empty_fallback() {
+        assert_eq!(sanitize_name(""), "tpl");
+        assert_eq!(sanitize_name(":"), "tpl");
+        assert_eq!(sanitize_name("//"), "tpl");
+    }
+
+    // ---- find_subseq ---------------------------------------------------
+
+    #[test]
+    fn find_subseq_positions() {
+        assert_eq!(find_subseq(b"hello world", b"hello"), Some(0));
+        assert_eq!(find_subseq(b"hello world", b"world"), Some(6));
+        assert_eq!(find_subseq(b"hello world", b"o w"), Some(4));
+    }
+
+    #[test]
+    fn find_subseq_not_found() {
+        assert_eq!(find_subseq(b"abc", b"xyz"), None);
+        assert_eq!(find_subseq(b"short", b"longerthanhaystack"), None);
+    }
+
+    // ---- SandboxRec serde ----------------------------------------------
+
+    #[test]
+    fn sandbox_rec_roundtrip() {
+        let rec = SandboxRec {
+            sandbox_id: "i123".into(),
+            template_id: "default".into(),
+            client_id: "shim".into(),
+            domain: Some("localhost".into()),
+            envd_version: "0.5.0".into(),
+            envd_access_token: Some("tok".into()),
+            alias: None,
+            metadata: None,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            end_at: "2026-01-01T01:00:00Z".into(),
+            cpu_count: 2,
+            memory_mb: 1024,
+            disk_size_mb: 4096,
+            state: "running".into(),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        // Field names are renamed to camelCase E2B-style.
+        assert!(json.contains("\"sandboxID\":\"i123\""));
+        assert!(json.contains("\"startedAt\":\"2026-01-01T00:00:00Z\""));
+        let back: SandboxRec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sandbox_id, "i123");
+        assert_eq!(back.cpu_count, 2);
+        assert_eq!(back.state, "running");
+    }
+}

@@ -675,3 +675,98 @@ fn main() -> Result<()> {
     shutdown.store(true, Ordering::Relaxed);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixStream as TUS;
+
+    #[tokio::test]
+    async fn frame_roundtrip_empty() {
+        let (mut a, mut b) = TUS::pair().unwrap();
+        send_frame_async(&mut a, b"").await.unwrap();
+        let got = recv_frame_async(&mut b).await.unwrap();
+        assert_eq!(got, Vec::<u8>::new());
+    }
+
+    #[tokio::test]
+    async fn frame_roundtrip_1k() {
+        let payload = vec![0xCDu8; 1024];
+        let (mut a, mut b) = TUS::pair().unwrap();
+        send_frame_async(&mut a, &payload).await.unwrap();
+        let got = recv_frame_async(&mut b).await.unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn frame_recv_rejects_oversize_header() {
+        let (mut a, mut b) = TUS::pair().unwrap();
+        use tokio::io::AsyncWriteExt;
+        let oversize = (MAX_FRAME as u32 + 1).to_be_bytes();
+        a.write_all(&oversize).await.unwrap();
+        drop(a);
+        let err = recv_frame_async(&mut b).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn frame_recv_eof_on_truncated_payload() {
+        let (mut a, mut b) = TUS::pair().unwrap();
+        use tokio::io::AsyncWriteExt;
+        a.write_all(&100u32.to_be_bytes()).await.unwrap();
+        a.write_all(b"short").await.unwrap();
+        drop(a);
+        let err = recv_frame_async(&mut b).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn pb_job_roundtrip() {
+        let mut env = ::std::collections::HashMap::new();
+        env.insert("FOO".into(), "bar".into());
+        let mut files = ::std::collections::HashMap::new();
+        files.insert("hello.txt".into(), "world".into());
+        let job = pb::Job {
+            code: "print(2+2)".into(),
+            timeout: 30,
+            env, files,
+            persist_changes: true,
+            persist_root_label: "label".into(),
+        };
+        let bytes = job.encode_to_vec();
+        let decoded = pb::Job::decode(&*bytes).unwrap();
+        assert_eq!(decoded.code, "print(2+2)");
+        assert_eq!(decoded.timeout, 30);
+        assert_eq!(decoded.env.get("FOO").unwrap(), "bar");
+        assert_eq!(decoded.files.get("hello.txt").unwrap(), "world");
+        assert!(decoded.persist_changes);
+    }
+
+    #[test]
+    fn pb_child_response_roundtrip_with_binary() {
+        let mut b64 = ::std::collections::HashMap::new();
+        b64.insert("blob.bin".into(), "AAAA".into());
+        let resp = pb::ChildResponse {
+            stdout: "ok".into(),
+            stderr: "".into(),
+            exit_code: 0,
+            expire: false,
+            lifecycle: Some(pb::Lifecycle {
+                rss_mb: 12,
+                requests_served: 5,
+                age_sec: 60,
+                total_exec_ms: 100,
+                expire_reason: "".into(),
+            }),
+            output_files: ::std::collections::HashMap::new(),
+            deleted_files: vec!["gone.txt".into()],
+            output_files_b64: b64,
+        };
+        let bytes = resp.encode_to_vec();
+        let decoded = pb::ChildResponse::decode(&*bytes).unwrap();
+        assert_eq!(decoded.stdout, "ok");
+        assert_eq!(decoded.deleted_files, vec!["gone.txt"]);
+        assert_eq!(decoded.output_files_b64.get("blob.bin").unwrap(), "AAAA");
+        assert_eq!(decoded.lifecycle.as_ref().unwrap().requests_served, 5);
+    }
+}

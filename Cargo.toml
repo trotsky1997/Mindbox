@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "api-rust",
+    "e2b-shim",
+    "worker-rust",
+    "template-builder",
+]
+
+# Per-crate [package] / [dependencies] live in each crate's own Cargo.toml.
+# This file exists so `cargo test --workspace` and `cargo clippy --workspace`
+# pick up every crate in one invocation (used by .github/workflows/ci.yml).

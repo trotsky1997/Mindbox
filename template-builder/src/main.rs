@@ -268,3 +268,44 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_cfg_happy_path() {
+        let toml = r#"
+name = "default"
+base_image = "python:3.12-slim"
+prewarm = ["numpy", "pandas"]
+extra_pip = ["torch"]
+pool_size = 32
+"#;
+        let cfg: TemplateCfg = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.name, "default");
+        assert_eq!(cfg.base_image, "python:3.12-slim");
+        assert_eq!(cfg.prewarm, vec!["numpy", "pandas"]);
+        assert_eq!(cfg.extra_pip, vec!["torch"]);
+        assert_eq!(cfg.pool_size, 32);
+    }
+
+    #[test]
+    fn template_cfg_uses_defaults_when_fields_missing() {
+        // All fields are #[serde(default)]; empty TOML should parse and use defaults.
+        let cfg: TemplateCfg = toml::from_str("").expect("parse empty");
+        assert_eq!(cfg.name, "");                          // default_name = empty
+        assert_eq!(cfg.base_image, default_base());        // python:3.12-slim
+        assert!(cfg.prewarm.is_empty());
+        assert!(cfg.extra_pip.is_empty());
+        assert_eq!(cfg.pool_size, default_pool_size());    // 32
+    }
+
+    #[test]
+    fn template_cfg_rejects_malformed_toml() {
+        // Unterminated string is a parse error, NOT a missing-field error.
+        let err = toml::from_str::<TemplateCfg>("name = \"unterminated").unwrap_err();
+        // We don't assert the exact error message — just that parsing failed.
+        let _ = err.to_string();
+    }
+}
