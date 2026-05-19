@@ -1,8 +1,0 @@
-# Marker file. The compose file + Dockerfile drive everything for this
-# template. template.toml is still read by api-rust to pick up pool_size,
-# memory_reservation, etc. (the build is handled by compose).
-name = "default-compose"
-pool_size = 16
-containers = 1
-memory_reservation = "2g"
-pids_limit = 4096

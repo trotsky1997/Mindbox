@@ -1,8 +1,0 @@
-name = "default"
-base_image = "python:3.12-slim"
-prewarm = []
-extra_pip = []
-pool_size = 16
-containers = 1
-memory_reservation = "2g"
-pids_limit = 4096

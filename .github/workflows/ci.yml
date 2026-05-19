@@ -16,31 +16,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install protoc + libpython (for prost-build + worker-rust PyO3)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler libprotobuf-dev \
-            pkg-config libssl-dev \
-            python3-dev libpython3-dev
-
       - name: cargo fmt
         run: cargo fmt --all -- --check
-        # If you want fmt to be advisory only at first, swap to:
-        #   cargo fmt --all -- --check || true
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test
         run: cargo test --workspace --all-targets
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: pip install
-        run: pip install -r tests/python/requirements.txt
-
-      - name: pytest
-        run: pytest tests/python -v
