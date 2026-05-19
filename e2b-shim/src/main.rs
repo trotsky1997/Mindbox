@@ -703,7 +703,7 @@ async fn process_start_tools(
     let http = state.http.clone();
     let tx2 = tx.clone();
     tokio::spawn(async move {
-        let body = serde_json::json!({ "cmd": bash_cmd, "timeout": 60 });
+        let body = serde_json::json!({ "command": bash_cmd, "timeout": 60 });
         let url = format!("{}/v2/sessions/{}/tools/bash", upstream, sid);
         let resp = http
             .post(&url)

@@ -77,7 +77,7 @@ curl -s -X POST http://127.0.0.1:8000/v2/sessions \
 
 curl -s -X POST http://127.0.0.1:8000/v2/sessions/<sid>/tools/bash \
   -H 'Content-Type: application/json' \
-  -d '{"cmd":"echo hi"}'
+  -d '{"command":"echo hi"}'
 ```
 
 ## Tool API
@@ -86,15 +86,19 @@ All seven tools share the same shape — `POST /v2/sessions/:sid/tools/:name`
 with a JSON body. See `tools-rust/src/main.rs` for the exact request/
 response structs. Quick reference:
 
-| Tool   | Body                                              | Returns                                 |
-|--------|---------------------------------------------------|-----------------------------------------|
-| read   | `{path}`                                          | `{content,bytes}` (UTF-8 lossy)          |
-| write  | `{path,content}`                                  | `{bytes}`                                |
-| edit   | `{path,old_string,new_string,replace_all?}`       | `{replacements}` / 400 on ambiguous     |
-| ls     | `{path?}`                                         | `{entries:[{name,kind,size}]}`           |
-| grep   | `{pattern,path?,output_mode?,max_files?}`         | `{matches/files/counts,walked,truncated}`|
-| find   | `{pattern,path?,max_results?}`                    | `{paths,walked,truncated}`               |
-| bash   | `{cmd,timeout?}`                                  | `{stdout,stderr,exit_code,timed_out}`    |
+| Tool   | Body                                                                | Returns                                  |
+|--------|---------------------------------------------------------------------|------------------------------------------|
+| read   | `{path,offset?,limit?}`                                             | `{content,bytes}` (UTF-8 lossy)           |
+| write  | `{path,content}`                                                    | `{bytes}`                                 |
+| edit   | `{path,edits:[{oldText,newText}]}`                                  | `{replacements}` / 400 on ambiguous      |
+| ls     | `{path?,limit?}`                                                    | `{entries:[{name,kind,size}]}`            |
+| grep   | `{pattern,path?,glob?,ignoreCase?,literal?,context?,limit?}`        | `{matches/files/counts,walked,truncated}` |
+| find   | `{pattern,path?,limit?}`                                            | `{paths,walked,truncated}`                |
+| bash   | `{command,timeout?}`                                                | `{stdout,stderr,exit_code,timed_out}`     |
+
+Compatibility: legacy Mindbox fields are still accepted as deprecated aliases:
+`bash.cmd`, `edit.old_string/new_string/replace_all`, `grep.output_mode/max_files`,
+and `find.max_results`.
 
 Path validation: absolute paths and `..` traversal are rejected at the
 API boundary; everything is resolved relative to the session cwd.

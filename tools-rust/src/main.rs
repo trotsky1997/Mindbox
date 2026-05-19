@@ -8,9 +8,9 @@
 //!   GET    /health
 //!   POST   /sessions                                  → {session_id}
 //!   DELETE /sessions/:id
-//!   POST   /sessions/:id/tools/read    {path}         → {content, bytes}
-//!   POST   /sessions/:id/tools/write   {path, content}→ {bytes}
-//!   POST   /sessions/:id/tools/bash    {cmd, timeout?}→ {stdout, stderr, exit_code}
+//!   POST   /sessions/:id/tools/read    {path, offset?, limit?} → {content, bytes}
+//!   POST   /sessions/:id/tools/write   {path, content}         → {bytes}
+//!   POST   /sessions/:id/tools/bash    {command, timeout?}     → {stdout, stderr, exit_code}
 //!
 //! Paths are resolved relative to the session's cwd; absolute paths
 //! and `..`-traversal are rejected at the API boundary.
@@ -383,6 +383,10 @@ struct CreateSessionResp {
 #[derive(Deserialize)]
 struct ReadReq {
     path: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -404,7 +408,8 @@ struct WriteResp {
 
 #[derive(Deserialize)]
 struct BashReq {
-    cmd: String,
+    #[serde(alias = "cmd")]
+    command: String,
     #[serde(default = "default_bash_timeout")]
     timeout: u64,
 }
@@ -421,11 +426,23 @@ struct BashResp {
     timed_out: bool,
 }
 
+#[derive(Clone, Deserialize)]
+struct EditReplacement {
+    #[serde(rename = "oldText")]
+    old_text: String,
+    #[serde(rename = "newText")]
+    new_text: String,
+}
+
 #[derive(Deserialize)]
 struct EditReq {
     path: String,
-    old_string: String,
-    new_string: String,
+    #[serde(default)]
+    edits: Vec<EditReplacement>,
+    #[serde(default)]
+    old_string: Option<String>,
+    #[serde(default)]
+    new_string: Option<String>,
     #[serde(default)]
     replace_all: bool,
 }
@@ -439,6 +456,8 @@ struct EditResp {
 struct LsReq {
     #[serde(default = "default_ls_path")]
     path: String,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 fn default_ls_path() -> String {
@@ -462,11 +481,20 @@ struct GrepReq {
     pattern: String,
     #[serde(default = "default_grep_path")]
     path: String,
-    /// "content" (default) — return matching lines; "files_with_matches" —
-    /// return only file paths; "count" — return per-file match counts.
+    #[serde(default)]
+    glob: Option<String>,
+    #[serde(default, rename = "ignoreCase")]
+    ignore_case: bool,
+    #[serde(default)]
+    literal: bool,
+    #[serde(default)]
+    context: usize,
+    #[serde(default = "default_grep_limit")]
+    limit: usize,
+    /// Legacy: "content" (default), "files_with_matches", or "count".
     #[serde(default = "default_grep_mode")]
     output_mode: String,
-    /// Max files to walk before bailing. Default 5000.
+    /// Legacy safety cap for walked files.
     #[serde(default = "default_grep_max_files")]
     max_files: usize,
 }
@@ -476,6 +504,9 @@ fn default_grep_path() -> String {
 }
 fn default_grep_mode() -> String {
     "content".into()
+}
+fn default_grep_limit() -> usize {
+    100
 }
 fn default_grep_max_files() -> usize {
     5000
@@ -504,15 +535,15 @@ struct FindReq {
     pattern: String,
     #[serde(default = "default_find_path")]
     path: String,
-    #[serde(default = "default_find_max")]
-    max_results: usize,
+    #[serde(default = "default_find_limit", alias = "max_results")]
+    limit: usize,
 }
 
 fn default_find_path() -> String {
     ".".into()
 }
-fn default_find_max() -> usize {
-    5000
+fn default_find_limit() -> usize {
+    1000
 }
 
 #[derive(Serialize)]
@@ -562,6 +593,137 @@ fn resolve_session<'a>(
         .ok_or((StatusCode::NOT_FOUND, format!("session {sid} not found")))
 }
 
+fn slice_lines(
+    content: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String, (StatusCode, String)> {
+    let start = offset.unwrap_or(1);
+    if start == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "offset is 1-indexed and must be greater than 0".to_string(),
+        ));
+    }
+    let Some(limit) = limit else {
+        return Ok(content
+            .split_inclusive('\n')
+            .skip(start - 1)
+            .collect::<String>());
+    };
+    if limit == 0 {
+        return Ok(String::new());
+    }
+    Ok(content
+        .split_inclusive('\n')
+        .skip(start - 1)
+        .take(limit)
+        .collect::<String>())
+}
+
+fn apply_edit_req(
+    src: &str,
+    path: &str,
+    req: &EditReq,
+) -> Result<(String, usize), (StatusCode, String)> {
+    let has_legacy = req.old_string.is_some() || req.new_string.is_some();
+    if has_legacy && !req.edits.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "use either edits[] or legacy old_string/new_string, not both".to_string(),
+        ));
+    }
+    if has_legacy {
+        let old = req.old_string.as_ref().ok_or((
+            StatusCode::BAD_REQUEST,
+            "legacy edit requires old_string".to_string(),
+        ))?;
+        let new = req.new_string.as_ref().ok_or((
+            StatusCode::BAD_REQUEST,
+            "legacy edit requires new_string".to_string(),
+        ))?;
+        if old.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "old_string must not be empty".to_string(),
+            ));
+        }
+        let n = src.matches(old).count();
+        if n == 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("old_string not found in {path}"),
+            ));
+        }
+        if n > 1 && !req.replace_all {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "old_string matches {n} times; set replace_all=true to confirm bulk replace"
+                ),
+            ));
+        }
+        let replaced = if req.replace_all {
+            src.replace(old, new)
+        } else {
+            src.replacen(old, new, 1)
+        };
+        return Ok((replaced, n));
+    }
+
+    if req.edits.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "edit requires at least one edits[] replacement".to_string(),
+        ));
+    }
+
+    let mut ranges = Vec::with_capacity(req.edits.len());
+    for edit in &req.edits {
+        if edit.old_text.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "oldText must not be empty".to_string(),
+            ));
+        }
+        let found: Vec<_> = src.match_indices(&edit.old_text).collect();
+        if found.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("oldText not found in {path}"),
+            ));
+        }
+        if found.len() > 1 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("oldText matches {} times in {path}", found.len()),
+            ));
+        }
+        let start = found[0].0;
+        ranges.push((start, start + edit.old_text.len(), edit.new_text.clone()));
+    }
+
+    ranges.sort_by_key(|(start, _, _)| *start);
+    for pair in ranges.windows(2) {
+        if pair[1].0 < pair[0].1 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "edits[] replacements must not overlap".to_string(),
+            ));
+        }
+    }
+
+    let mut out = String::with_capacity(src.len());
+    let mut cursor = 0usize;
+    for (start, end, new_text) in ranges {
+        out.push_str(&src[cursor..start]);
+        out.push_str(&new_text);
+        cursor = end;
+    }
+    out.push_str(&src[cursor..]);
+    Ok((out, req.edits.len()))
+}
+
 // ---------------------------------------------------------------------------
 
 async fn health() -> Json<serde_json::Value> {
@@ -608,9 +770,18 @@ async fn tool_read(
     let bytes = tokio::fs::read(&target)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("read {}: {e}", req.path)))?;
-    let n = bytes.len();
     let content = String::from_utf8_lossy(&bytes).into_owned();
-    Ok(Json(ReadResp { content, bytes: n }))
+    if req.offset.is_none() && req.limit.is_none() {
+        return Ok(Json(ReadResp {
+            content,
+            bytes: bytes.len(),
+        }));
+    }
+    let content = slice_lines(&content, req.offset, req.limit)?;
+    Ok(Json(ReadResp {
+        bytes: content.len(),
+        content,
+    }))
 }
 
 async fn tool_write(
@@ -669,6 +840,9 @@ async fn tool_ls(
         });
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
+    if let Some(limit) = req.limit {
+        entries.truncate(limit);
+    }
     Ok(Json(LsResp { entries }))
 }
 
@@ -682,28 +856,11 @@ async fn tool_edit(
     let src = tokio::fs::read_to_string(&target)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("read {}: {e}", req.path)))?;
-    let n = src.matches(&req.old_string).count();
-    if n == 0 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("old_string not found in {}", req.path),
-        ));
-    }
-    if n > 1 && !req.replace_all {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("old_string matches {n} times; set replace_all=true to confirm bulk replace"),
-        ));
-    }
-    let replaced = if req.replace_all {
-        src.replace(&req.old_string, &req.new_string)
-    } else {
-        src.replacen(&req.old_string, &req.new_string, 1)
-    };
+    let (replaced, replacements) = apply_edit_req(&src, &req.path, &req)?;
     tokio::fs::write(&target, replaced)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
-    Ok(Json(EditResp { replacements: n }))
+    Ok(Json(EditResp { replacements }))
 }
 
 async fn tool_grep(
@@ -727,27 +884,23 @@ async fn tool_grep(
         ));
     }
 
-    let pattern = req.pattern.clone();
-    let mode = req.output_mode.clone();
-    let max_files = req.max_files;
+    let grep = GrepSearchReq {
+        pattern: req.pattern.clone(),
+        glob: req.glob.clone(),
+        ignore_case: req.ignore_case,
+        literal: req.literal,
+        context: req.context,
+        limit: req.limit,
+        max_files: req.max_files,
+        want_content,
+        want_files,
+        want_count,
+    };
 
-    // Drive ripgrep's Sink API on a blocking thread so the daemon's main
-    // tokio runtime stays free to serve other tools.
     let cwd_clone = cwd.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        run_ripgrep_search(
-            &target,
-            &cwd_clone,
-            &pattern,
-            &mode,
-            max_files,
-            want_content,
-            want_files,
-            want_count,
-        )
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))??;
+    let result = tokio::task::spawn_blocking(move || run_ripgrep_search(&target, &cwd_clone, grep))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))??;
 
     Ok(Json(GrepResp {
         mode: req.output_mode,
@@ -759,6 +912,19 @@ async fn tool_grep(
     }))
 }
 
+struct GrepSearchReq {
+    pattern: String,
+    glob: Option<String>,
+    ignore_case: bool,
+    literal: bool,
+    context: usize,
+    limit: usize,
+    max_files: usize,
+    want_content: bool,
+    want_files: bool,
+    want_count: bool,
+}
+
 struct RipgrepResult {
     matches: Vec<GrepMatch>,
     files: Vec<String>,
@@ -767,33 +933,41 @@ struct RipgrepResult {
     truncated: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_ripgrep_search(
     target: &std::path::Path,
     cwd: &std::path::Path,
-    pattern: &str,
-    _mode: &str,
-    max_files: usize,
-    want_content: bool,
-    want_files: bool,
-    want_count: bool,
+    req: GrepSearchReq,
 ) -> Result<RipgrepResult, (StatusCode, String)> {
-    use grep::regex::RegexMatcher;
-    use grep::searcher::sinks::UTF8;
-    use grep::searcher::SearcherBuilder;
+    use grep::matcher::Matcher;
+    use grep::regex::RegexMatcherBuilder;
+    use std::collections::BTreeSet;
 
-    let matcher = RegexMatcher::new(pattern)
+    let mut builder = RegexMatcherBuilder::new();
+    builder
+        .case_insensitive(req.ignore_case)
+        .fixed_strings(req.literal);
+    let matcher = builder
+        .build(&req.pattern)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad regex: {e}")))?;
+    let glob = match req.glob.as_deref() {
+        Some(pattern) => Some(
+            globset::Glob::new(pattern)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad glob: {e}")))?
+                .compile_matcher(),
+        ),
+        None => None,
+    };
 
     let mut walked = 0usize;
     let mut truncated = false;
     let mut matches = Vec::<GrepMatch>::new();
     let mut files = Vec::<String>::new();
     let mut counts = Vec::<(String, u64)>::new();
+    let mut emitted_matches = 0usize;
 
     let walker = ignore::WalkBuilder::new(target)
         .follow_links(false)
-        .standard_filters(false) // don't auto-skip .gitignore'd files
+        .standard_filters(false)
         .build();
 
     for ent in walker.flatten() {
@@ -801,7 +975,7 @@ fn run_ripgrep_search(
             continue;
         }
         walked += 1;
-        if walked > max_files {
+        if walked > req.max_files {
             truncated = true;
             break;
         }
@@ -810,40 +984,76 @@ fn run_ripgrep_search(
             Ok(p) => p.to_string_lossy().into_owned(),
             Err(_) => path.to_string_lossy().into_owned(),
         };
-
-        let mut per_file = 0u64;
-        let mut searcher = SearcherBuilder::new()
-            .binary_detection(grep::searcher::BinaryDetection::quit(b'\x00'))
-            .line_number(true)
-            .build();
-
-        let rel_for_sink = rel.clone();
-        let collect_content = want_content;
-        let result = searcher.search_path(
-            &matcher,
-            path,
-            UTF8(|line_num, line| {
-                per_file += 1;
-                if collect_content {
-                    matches.push(GrepMatch {
-                        path: rel_for_sink.clone(),
-                        line: line_num,
-                        text: line.trim_end_matches('\n').to_string(),
-                    });
-                }
-                Ok(true)
-            }),
-        );
-        // Errors (binary detected, read errors) → just skip this file.
-        if result.is_err() {
+        if glob.as_ref().is_some_and(|g| !g.is_match(&rel)) {
             continue;
         }
-        if per_file > 0 {
-            if want_files {
-                files.push(rel);
-            } else if want_count {
-                counts.push((rel, per_file));
+
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        if bytes.contains(&b'\0') {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let mut matched_lines = Vec::new();
+        let mut per_file = 0u64;
+
+        for (idx, line) in lines.iter().enumerate() {
+            if !matcher.is_match(line.as_bytes()).unwrap_or(false) {
+                continue;
             }
+            per_file += 1;
+            if req.want_content {
+                if emitted_matches >= req.limit {
+                    truncated = true;
+                    break;
+                }
+                matched_lines.push(idx);
+                emitted_matches += 1;
+            }
+        }
+
+        if per_file > 0 {
+            if req.want_content {
+                let mut selected = BTreeSet::new();
+                for idx in matched_lines {
+                    let start = idx.saturating_sub(req.context);
+                    let end = idx
+                        .saturating_add(req.context)
+                        .min(lines.len().saturating_sub(1));
+                    for line_idx in start..=end {
+                        selected.insert(line_idx);
+                    }
+                }
+                for line_idx in selected {
+                    matches.push(GrepMatch {
+                        path: rel.clone(),
+                        line: (line_idx + 1) as u64,
+                        text: lines[line_idx]
+                            .trim_end_matches('\n')
+                            .trim_end_matches('\r')
+                            .to_string(),
+                    });
+                }
+            } else if req.want_files {
+                if files.len() >= req.limit {
+                    truncated = true;
+                    break;
+                }
+                files.push(rel.clone());
+            } else if req.want_count {
+                if counts.len() >= req.limit {
+                    truncated = true;
+                    break;
+                }
+                counts.push((rel.clone(), per_file));
+            }
+        }
+
+        if truncated && req.want_content {
+            break;
         }
     }
     Ok(RipgrepResult {
@@ -881,7 +1091,7 @@ async fn tool_find(
         walked += 1;
         // Same 4× over-walk cap as before — wildcard patterns like `**`
         // on deep trees would otherwise scan unbounded.
-        if walked > req.max_results.saturating_mul(4).max(20_000) {
+        if walked > req.limit.saturating_mul(4).max(20_000) {
             truncated = true;
             break;
         }
@@ -891,7 +1101,7 @@ async fn tool_find(
         };
         if glob.is_match(&rel) {
             paths.push(rel);
-            if paths.len() >= req.max_results {
+            if paths.len() >= req.limit {
                 truncated = true;
                 break;
             }
@@ -911,7 +1121,7 @@ async fn tool_bash(
 ) -> Result<Json<BashResp>, (StatusCode, String)> {
     let cwd = resolve_session(&state, &sid)?.clone();
     let mut cmd = Command::new("/bin/bash");
-    cmd.arg("-c").arg(&req.cmd);
+    cmd.arg("-c").arg(&req.command);
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
@@ -1135,6 +1345,80 @@ mod tests {
         assert_eq!(out, Path::new("/sandboxes/a/bar"));
     }
 
+    #[test]
+    fn bash_request_accepts_canonical_and_legacy_command() {
+        let canonical: BashReq = serde_json::from_value(serde_json::json!({
+            "command": "echo hi"
+        }))
+        .unwrap();
+        assert_eq!(canonical.command, "echo hi");
+        assert_eq!(canonical.timeout, 30);
+
+        let legacy: BashReq = serde_json::from_value(serde_json::json!({
+            "cmd": "echo old",
+            "timeout": 7
+        }))
+        .unwrap();
+        assert_eq!(legacy.command, "echo old");
+        assert_eq!(legacy.timeout, 7);
+    }
+
+    #[test]
+    fn edit_request_accepts_canonical_and_legacy_shapes() {
+        let canonical: EditReq = serde_json::from_value(serde_json::json!({
+            "path": "f.txt",
+            "edits": [{ "oldText": "a", "newText": "b" }]
+        }))
+        .unwrap();
+        assert_eq!(canonical.edits.len(), 1);
+        assert_eq!(canonical.edits[0].old_text, "a");
+        assert!(canonical.old_string.is_none());
+
+        let legacy: EditReq = serde_json::from_value(serde_json::json!({
+            "path": "f.txt",
+            "old_string": "a",
+            "new_string": "b",
+            "replace_all": true
+        }))
+        .unwrap();
+        assert_eq!(legacy.old_string.as_deref(), Some("a"));
+        assert_eq!(legacy.new_string.as_deref(), Some("b"));
+        assert!(legacy.replace_all);
+    }
+
+    #[test]
+    fn find_request_accepts_limit_and_legacy_max_results() {
+        let canonical: FindReq = serde_json::from_value(serde_json::json!({
+            "pattern": "*.rs",
+            "limit": 11
+        }))
+        .unwrap();
+        assert_eq!(canonical.path, ".");
+        assert_eq!(canonical.limit, 11);
+
+        let legacy: FindReq = serde_json::from_value(serde_json::json!({
+            "pattern": "*.rs",
+            "max_results": 12
+        }))
+        .unwrap();
+        assert_eq!(legacy.limit, 12);
+    }
+
+    #[test]
+    fn grep_request_accepts_camel_case_ignore_case() {
+        let req: GrepReq = serde_json::from_value(serde_json::json!({
+            "pattern": "needle",
+            "ignoreCase": true,
+            "literal": true,
+            "limit": 9
+        }))
+        .unwrap();
+        assert!(req.ignore_case);
+        assert!(req.literal);
+        assert_eq!(req.limit, 9);
+        assert_eq!(req.output_mode, "content");
+    }
+
     #[tokio::test]
     async fn write_then_read_roundtrip() {
         let (_td, state) = tmp_state();
@@ -1160,12 +1444,53 @@ mod tests {
             Path(sid),
             Json(ReadReq {
                 path: "hello.txt".into(),
+                offset: None,
+                limit: None,
             }),
         )
         .await
         .unwrap();
         assert_eq!(read.0.content, "hi there");
         assert_eq!(read.0.bytes, 8);
+    }
+
+    #[tokio::test]
+    async fn read_supports_offset_and_limit() {
+        let (_td, state) = tmp_state();
+        let sid = "read-slice-sid".to_string();
+        let cwd = state.sandbox_root.join(&sid);
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        tokio::fs::write(cwd.join("lines.txt"), "one\ntwo\nthree\nfour\n")
+            .await
+            .unwrap();
+        state.sessions.insert(sid.clone(), cwd);
+
+        let read = tool_read(
+            State(state.clone()),
+            Path(sid.clone()),
+            Json(ReadReq {
+                path: "lines.txt".into(),
+                offset: Some(2),
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.0.content, "two\nthree\n");
+        assert_eq!(read.0.bytes, "two\nthree\n".len());
+
+        let empty = tool_read(
+            State(state),
+            Path(sid),
+            Json(ReadReq {
+                path: "lines.txt".into(),
+                offset: Some(99),
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty.0.content, "");
     }
 
     #[tokio::test]
@@ -1181,7 +1506,7 @@ mod tests {
             State(state),
             Path(sid),
             Json(BashReq {
-                cmd: "ls".into(),
+                command: "ls".into(),
                 timeout: 5,
             }),
         )
@@ -1204,7 +1529,7 @@ mod tests {
             State(state),
             Path(sid),
             Json(BashReq {
-                cmd: "sleep 5".into(),
+                command: "sleep 5".into(),
                 timeout: 1,
             }),
         )
@@ -1304,15 +1629,43 @@ mod tests {
         let cwd = state.sessions.get(&sid).unwrap().clone();
         tokio::fs::write(cwd.join("a.txt"), "x").await.unwrap();
         tokio::fs::create_dir_all(cwd.join("sub")).await.unwrap();
-        let resp = tool_ls(State(state), Path(sid), Json(LsReq { path: ".".into() }))
-            .await
-            .unwrap();
+        let resp = tool_ls(
+            State(state),
+            Path(sid),
+            Json(LsReq {
+                path: ".".into(),
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap();
         let names: Vec<_> = resp.0.entries.iter().map(|e| e.name.clone()).collect();
         assert!(names.contains(&"a.txt".to_string()));
         assert!(names.contains(&"sub".to_string()));
         let a = resp.0.entries.iter().find(|e| e.name == "a.txt").unwrap();
         assert_eq!(a.kind, "file");
         assert_eq!(a.size, 1);
+    }
+
+    #[tokio::test]
+    async fn ls_respects_limit_after_sorting() {
+        let (_td, state) = tmp_state();
+        let sid = make_sid(&state, "ls-limit-sid").await;
+        let cwd = state.sessions.get(&sid).unwrap().clone();
+        tokio::fs::write(cwd.join("b.txt"), "").await.unwrap();
+        tokio::fs::write(cwd.join("a.txt"), "").await.unwrap();
+        let resp = tool_ls(
+            State(state),
+            Path(sid),
+            Json(LsReq {
+                path: ".".into(),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.0.entries.len(), 1);
+        assert_eq!(resp.0.entries[0].name, "a.txt");
     }
 
     #[tokio::test]
@@ -1328,8 +1681,12 @@ mod tests {
             Path(sid),
             Json(EditReq {
                 path: "f.txt".into(),
-                old_string: "beta".into(),
-                new_string: "BETA".into(),
+                edits: vec![EditReplacement {
+                    old_text: "beta".into(),
+                    new_text: "BETA".into(),
+                }],
+                old_string: None,
+                new_string: None,
                 replace_all: false,
             }),
         )
@@ -1338,6 +1695,71 @@ mod tests {
         assert_eq!(resp.0.replacements, 1);
         let body = tokio::fs::read_to_string(cwd.join("f.txt")).await.unwrap();
         assert_eq!(body, "alpha BETA gamma");
+    }
+
+    #[tokio::test]
+    async fn edit_applies_multiple_replacements_against_original() {
+        let (_td, state) = tmp_state();
+        let sid = make_sid(&state, "edit-multi-sid").await;
+        let cwd = state.sessions.get(&sid).unwrap().clone();
+        tokio::fs::write(cwd.join("f.txt"), "alpha beta gamma delta")
+            .await
+            .unwrap();
+        let resp = tool_edit(
+            State(state.clone()),
+            Path(sid),
+            Json(EditReq {
+                path: "f.txt".into(),
+                edits: vec![
+                    EditReplacement {
+                        old_text: "beta".into(),
+                        new_text: "BETA".into(),
+                    },
+                    EditReplacement {
+                        old_text: "delta".into(),
+                        new_text: "DELTA".into(),
+                    },
+                ],
+                old_string: None,
+                new_string: None,
+                replace_all: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.0.replacements, 2);
+        let body = tokio::fs::read_to_string(cwd.join("f.txt")).await.unwrap();
+        assert_eq!(body, "alpha BETA gamma DELTA");
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_overlapping_canonical_replacements() {
+        let (_td, state) = tmp_state();
+        let sid = make_sid(&state, "edit-overlap-sid").await;
+        let cwd = state.sessions.get(&sid).unwrap().clone();
+        tokio::fs::write(cwd.join("f.txt"), "abcdef").await.unwrap();
+        let err = tool_edit(
+            State(state),
+            Path(sid),
+            Json(EditReq {
+                path: "f.txt".into(),
+                edits: vec![
+                    EditReplacement {
+                        old_text: "abc".into(),
+                        new_text: "X".into(),
+                    },
+                    EditReplacement {
+                        old_text: "bcd".into(),
+                        new_text: "Y".into(),
+                    },
+                ],
+                old_string: None,
+                new_string: None,
+                replace_all: false,
+            }),
+        )
+        .await;
+        assert!(matches!(err, Err((StatusCode::BAD_REQUEST, _))));
     }
 
     #[tokio::test]
@@ -1353,8 +1775,9 @@ mod tests {
             Path(sid),
             Json(EditReq {
                 path: "f.txt".into(),
-                old_string: "ab".into(),
-                new_string: "Z".into(),
+                edits: Vec::new(),
+                old_string: Some("ab".into()),
+                new_string: Some("Z".into()),
                 replace_all: false,
             }),
         )
@@ -1375,8 +1798,9 @@ mod tests {
             Path(sid),
             Json(EditReq {
                 path: "f.txt".into(),
-                old_string: "ab".into(),
-                new_string: "Z".into(),
+                edits: Vec::new(),
+                old_string: Some("ab".into()),
+                new_string: Some("Z".into()),
                 replace_all: true,
             }),
         )
@@ -1401,6 +1825,11 @@ mod tests {
             Json(GrepReq {
                 pattern: "hello".into(),
                 path: ".".into(),
+                glob: None,
+                ignore_case: false,
+                literal: false,
+                context: 0,
+                limit: 100,
                 output_mode: "content".into(),
                 max_files: 100,
             }),
@@ -1410,6 +1839,55 @@ mod tests {
         assert_eq!(resp.0.matches.len(), 2);
         assert_eq!(resp.0.matches[0].line, 1);
         assert_eq!(resp.0.matches[1].line, 3);
+    }
+
+    #[tokio::test]
+    async fn grep_supports_canonical_filters_and_context() {
+        let (_td, state) = tmp_state();
+        let sid = make_sid(&state, "grep-canon-sid").await;
+        let cwd = state.sessions.get(&sid).unwrap().clone();
+        tokio::fs::create_dir_all(cwd.join("src")).await.unwrap();
+        tokio::fs::write(
+            cwd.join("src/a.txt"),
+            "before\nHello.*\nafter\nlater\nHello.* second\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(cwd.join("src/b.md"), "Hello.*\n")
+            .await
+            .unwrap();
+        let resp = tool_grep(
+            State(state),
+            Path(sid),
+            Json(GrepReq {
+                pattern: "hello.*".into(),
+                path: ".".into(),
+                glob: Some("**/*.txt".into()),
+                ignore_case: true,
+                literal: true,
+                context: 1,
+                limit: 1,
+                output_mode: "content".into(),
+                max_files: 100,
+            }),
+        )
+        .await
+        .unwrap();
+        let lines: Vec<_> = resp
+            .0
+            .matches
+            .iter()
+            .map(|m| (m.path.as_str(), m.line, m.text.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("src/a.txt", 1, "before"),
+                ("src/a.txt", 2, "Hello.*"),
+                ("src/a.txt", 3, "after"),
+            ]
+        );
+        assert!(resp.0.truncated);
     }
 
     #[tokio::test]
@@ -1427,6 +1905,11 @@ mod tests {
             Json(GrepReq {
                 pattern: "needle".into(),
                 path: ".".into(),
+                glob: None,
+                ignore_case: false,
+                literal: false,
+                context: 0,
+                limit: 100,
                 output_mode: "files_with_matches".into(),
                 max_files: 100,
             }),
@@ -1452,7 +1935,7 @@ mod tests {
             Json(FindReq {
                 pattern: "**/*.rs".into(),
                 path: ".".into(),
-                max_results: 100,
+                limit: 100,
             }),
         )
         .await
@@ -1460,6 +1943,16 @@ mod tests {
         let mut paths = resp.0.paths;
         paths.sort();
         assert_eq!(paths, vec!["a.rs".to_string(), "sub/b.rs".to_string()]);
+    }
+
+    #[test]
+    fn find_legacy_max_results_deserializes_to_limit() {
+        let req: FindReq = serde_json::from_value(serde_json::json!({
+            "pattern": "*.txt",
+            "max_results": 3
+        }))
+        .unwrap();
+        assert_eq!(req.limit, 3);
     }
 
     #[tokio::test]
@@ -1478,7 +1971,7 @@ mod tests {
             Json(FindReq {
                 pattern: "*.txt".into(),
                 path: ".".into(),
-                max_results: 3,
+                limit: 3,
             }),
         )
         .await
