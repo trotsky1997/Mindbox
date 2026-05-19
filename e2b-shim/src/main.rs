@@ -155,6 +155,27 @@ struct AppState {
     tos: Option<Arc<TosConfig>>,
     template_builds: DashMap<String, Arc<TemplateBuild>>,
     template_id_to_build: DashMap<String, String>,
+    template_tags: DashMap<String, Vec<String>>,   // template_name -> tags
+    volumes: DashMap<String, VolumeRec>,            // volume_id -> rec
+    snapshots: DashMap<String, SnapshotRec>,        // snapshot_id -> rec
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VolumeRec {
+    #[serde(rename = "volumeID")] volume_id: String,
+    name: String,
+    #[serde(rename = "sizeMB", default = "default_vol_size")] size_mb: u32,
+    #[serde(rename = "createdAt")] created_at: String,
+}
+fn default_vol_size() -> u32 { 1024 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotRec {
+    #[serde(rename = "snapshotID")] snapshot_id: String,
+    #[serde(rename = "sandboxID")] sandbox_id: String,
+    #[serde(rename = "templateID")] template_id: String,
+    #[serde(rename = "tosURL")] tos_url: String,
+    #[serde(rename = "createdAt")] created_at: String,
 }
 
 #[derive(Debug)]
@@ -548,6 +569,17 @@ async fn process_start(
 
     // Resolve sandbox + its host fs dir; serialize fs into files= map and set cwd to /workspace.
     let sid = pick_sandbox_id(&state, &headers).ok();
+    // Enforce paused state — reject commands on a paused sandbox without
+    // touching the underlying worker container (the pool is shared).
+    if let Some(s_ref) = sid.as_ref() {
+        if let Some(rec) = state.sandboxes.get(s_ref) {
+            if rec.state == "paused" {
+                return (StatusCode::CONFLICT,
+                    r#"{"code":"conflict","message":"sandbox is paused; call resume() first"}"#)
+                    .into_response();
+            }
+        }
+    }
     let sandbox_files: std::collections::HashMap<String, String> = match &sid {
         Some(s) => {
             let root = sandbox_fs_dir(s);
@@ -1436,6 +1468,428 @@ async fn templates_build_logs(
 }
 
 
+
+// ---- E2B full coverage: sandboxes/templates/tags/snapshots/volumes ------
+//
+// All container-touching ops are metadata-only — we must NOT mess with the
+// shared worker pool that backs every sandbox. See README "Container session
+// reuse semantics".
+
+// ---- Sandboxes: list / metrics / logs / lifecycle (metadata-only) -------
+
+async fn sandboxes_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SandboxRec>>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let v: Vec<SandboxRec> = state.sandboxes.iter().map(|r| r.value().clone()).collect();
+    Ok(Json(v))
+}
+
+#[derive(serde::Serialize)]
+struct SandboxMetrics {
+    #[serde(rename = "sandboxID")] sandbox_id: String,
+    #[serde(rename = "cpuUsedPct")] cpu_used_pct: f32,
+    #[serde(rename = "memUsedMB")] mem_used_mb: u32,
+    #[serde(rename = "diskUsedMB")] disk_used_mb: u32,
+    timestamp: String,
+}
+
+async fn sandboxes_metrics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SandboxMetrics>>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    // We don't track per-sandbox compute (shared pool); return zero rows.
+    let now = chrono::Utc::now().to_rfc3339();
+    let out: Vec<SandboxMetrics> = state.sandboxes.iter().map(|r| SandboxMetrics {
+        sandbox_id: r.key().clone(),
+        cpu_used_pct: 0.0,
+        mem_used_mb: 0,
+        disk_used_mb: 0,
+        timestamp: now.clone(),
+    }).collect();
+    Ok(Json(out))
+}
+
+async fn sandbox_metrics_one(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(sid): Path<String>,
+) -> Result<Json<Vec<SandboxMetrics>>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    state.sandboxes.get(&sid).ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
+    Ok(Json(vec![SandboxMetrics {
+        sandbox_id: sid,
+        cpu_used_pct: 0.0, mem_used_mb: 0, disk_used_mb: 0,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    }]))
+}
+
+async fn sandbox_logs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(sid): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    state.sandboxes.get(&sid).ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
+    // Shared pool: no aggregate sandbox log. SDK gets an empty page.
+    Ok(Json(serde_json::json!({ "logs": [] })))
+}
+
+async fn sandbox_pause(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(sid): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let mut rec = state.sandboxes.get(&sid)
+        .map(|r| r.clone())
+        .ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
+    if rec.state == "paused" { return Ok(StatusCode::NO_CONTENT); }
+    rec.state = "paused".into();
+    state.sandboxes.insert(sid.clone(), rec.clone());
+    persist_sandbox(&rec);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn sandbox_resume(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(sid): Path<String>,
+) -> Result<Json<SandboxRec>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let mut rec = state.sandboxes.get(&sid)
+        .map(|r| r.clone())
+        .ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
+    rec.state = "running".into();
+    // Push endAt forward — resume is implicit "I want this alive again".
+    let end = chrono::Utc::now() + chrono::Duration::seconds(900);
+    rec.end_at = end.to_rfc3339();
+    state.sandboxes.insert(sid.clone(), rec.clone());
+    persist_sandbox(&rec);
+    Ok(Json(rec))
+}
+
+async fn sandbox_connect(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(sid): Path<String>,
+) -> Result<Json<SandboxRec>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let rec = state.sandboxes.get(&sid)
+        .map(|r| r.clone())
+        .ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
+    Ok(Json(rec))
+}
+
+async fn sandbox_refreshes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(sid): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let mut rec = state.sandboxes.get(&sid)
+        .map(|r| r.clone())
+        .ok_or((StatusCode::NOT_FOUND, format!("sandbox {} not found", sid)))?;
+    // Heartbeat: extend endAt by the original lease window (15min).
+    let end = chrono::Utc::now() + chrono::Duration::seconds(900);
+    rec.end_at = end.to_rfc3339();
+    state.sandboxes.insert(sid.clone(), rec.clone());
+    persist_sandbox(&rec);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// POST /sandboxes/:id/snapshots — E2B native plural form. Bridges to the
+// existing /snapshot single-form handler (host-fs tarball → TOS).
+async fn sandbox_snapshots_e2b(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(sid): Path<String>,
+) -> Result<(StatusCode, Json<SnapshotRec>), (StatusCode, String)> {
+    // Delegate to the existing host-fs tarball → TOS handler.
+    let json = sandbox_snapshot(State(state.clone()), Path(sid.clone()), headers).await?;
+    let tos_url = json.0.get("tos_url").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let template_id = state.sandboxes.get(&sid).map(|r| r.template_id.clone()).unwrap_or_default();
+    let snap_id = format!("snap{}", chrono::Utc::now().format("%Y%m%dT%H%M%S%fZ"));
+    let snap = SnapshotRec {
+        snapshot_id: snap_id.clone(),
+        sandbox_id: sid.clone(),
+        template_id,
+        tos_url,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state.snapshots.insert(snap_id.clone(), snap.clone());
+    Ok((StatusCode::CREATED, Json(snap)))
+}
+
+async fn snapshots_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SnapshotRec>>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let v: Vec<SnapshotRec> = state.snapshots.iter().map(|r| r.value().clone()).collect();
+    Ok(Json(v))
+}
+
+// ---- Templates: list / detail / alias / delete / update / old create ----
+
+#[derive(serde::Serialize)]
+struct TemplateInfo {
+    #[serde(rename = "templateID")] template_id: String,
+    name: String,
+    aliases: Vec<String>,
+    tags: Vec<String>,
+    public: bool,
+    #[serde(rename = "buildID")] build_id: String,
+}
+
+fn list_template_names_on_disk() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(TEMPLATES_ROOT) {
+        for e in rd.flatten() {
+            if let Some(n) = e.file_name().to_str() {
+                if e.path().join("template.toml").exists() {
+                    out.push(n.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn build_id_for_name(state: &AppState, name: &str) -> String {
+    // If we registered a build for this name, surface it; else fabricate one.
+    for kv in state.template_builds.iter() {
+        if kv.value().name == name {
+            return kv.value().build_id.clone();
+        }
+    }
+    format!("b-{}", name)
+}
+
+async fn templates_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<TemplateInfo>>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let names = list_template_names_on_disk();
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let tags = state.template_tags.get(&name).map(|v| v.clone()).unwrap_or_default();
+        out.push(TemplateInfo {
+            template_id: format!("t-{}", name),
+            name: name.clone(),
+            aliases: vec![name.clone()],
+            tags,
+            public: false,
+            build_id: build_id_for_name(&state, &name),
+        });
+    }
+    Ok(Json(out))
+}
+
+async fn template_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tid): Path<String>,
+) -> Result<Json<TemplateInfo>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    // tid can be the templateID (t-<name>) OR the bare name OR a build id.
+    let name = if let Some(rest) = tid.strip_prefix("t-") {
+        rest.to_string()
+    } else if state.template_builds.get(&tid).is_some() {
+        state.template_builds.get(&tid).unwrap().name.clone()
+    } else {
+        tid.clone()
+    };
+    let tpl_dir = format!("{}/{}", TEMPLATES_ROOT, name);
+    if !std::path::Path::new(&tpl_dir).exists() {
+        return Err((StatusCode::NOT_FOUND, format!("template {} not found", name)));
+    }
+    let tags = state.template_tags.get(&name).map(|v| v.clone()).unwrap_or_default();
+    Ok(Json(TemplateInfo {
+        template_id: format!("t-{}", name),
+        name: name.clone(),
+        aliases: vec![name.clone()],
+        tags,
+        public: false,
+        build_id: build_id_for_name(&state, &name),
+    }))
+}
+
+async fn template_get_by_alias(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(alias): Path<String>,
+) -> Result<Json<TemplateInfo>, (StatusCode, String)> {
+    // We treat alias === name. Delegate.
+    template_get(State(state), headers, Path(alias)).await
+}
+
+async fn template_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tid): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let name = tid.strip_prefix("t-").unwrap_or(&tid).to_string();
+    let tpl_dir = format!("{}/{}", TEMPLATES_ROOT, name);
+    if std::fs::remove_dir_all(&tpl_dir).is_err() {
+        // Best-effort; absence is success.
+    }
+    state.template_tags.remove(&name);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct TemplateUpdate {
+    #[serde(default)] public: Option<bool>,
+    // We accept other fields silently — schema matches E2B but we ignore most.
+    #[serde(flatten)] _extra: serde_json::Value,
+}
+
+async fn template_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tid): Path<String>,
+    Json(_body): Json<TemplateUpdate>,
+) -> Result<Json<TemplateInfo>, (StatusCode, String)> {
+    // Treat update as no-op (we have nothing meaningful to mutate at the
+    // template level besides tags, which have their own endpoints).
+    template_get(State(state), headers, Path(tid)).await
+}
+
+// POST /templates and POST /v2/templates are older request shapes; route both
+// to the v3 handler, which already accepts a superset of the older fields.
+async fn templates_create_legacy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<TemplateBuildRequestV3>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    templates_create_v3(State(state), headers, Json(body)).await
+}
+
+// ---- Tags ---------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct AssignTagsBody {
+    #[serde(default, rename = "templateID")] template_id: Option<String>,
+    #[serde(default)] name: Option<String>,
+    #[serde(default)] tags: Vec<String>,
+}
+
+async fn tags_assign(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AssignTagsBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let name = body.template_id
+        .map(|t| t.strip_prefix("t-").unwrap_or(&t).to_string())
+        .or(body.name)
+        .ok_or((StatusCode::BAD_REQUEST, "missing templateID or name".into()))?;
+    state.template_tags.entry(name)
+        .or_insert_with(Vec::new)
+        .extend(body.tags);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn tags_remove(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AssignTagsBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let name = body.template_id
+        .map(|t| t.strip_prefix("t-").unwrap_or(&t).to_string())
+        .or(body.name)
+        .ok_or((StatusCode::BAD_REQUEST, "missing templateID or name".into()))?;
+    if let Some(mut v) = state.template_tags.get_mut(&name) {
+        v.retain(|t| !body.tags.contains(t));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn tags_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tid): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let name = tid.strip_prefix("t-").unwrap_or(&tid).to_string();
+    let tags = state.template_tags.get(&name).map(|v| v.clone()).unwrap_or_default();
+    Ok(Json(serde_json::json!({ "tags": tags })))
+}
+
+// ---- Volumes ------------------------------------------------------------
+//
+// Metadata-only: we track volume records and create a host dir per volume at
+// /var/lib/e2b-shim/volumes/<id>, but do NOT mount them into the worker
+// container (that would force per-sandbox bind-mounts and break the shared
+// pool). Users can still address volumes via the host fs dir; mounting into
+// commands is a future extension.
+
+const VOLUMES_ROOT: &str = "/var/lib/e2b-shim/volumes";
+
+#[derive(serde::Deserialize)]
+struct CreateVolumeBody {
+    #[serde(default)] name: Option<String>,
+    #[serde(default, rename = "sizeMB")] size_mb: Option<u32>,
+}
+
+async fn volumes_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateVolumeBody>,
+) -> Result<(StatusCode, Json<VolumeRec>), (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let vol_id = format!("vol{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ%f"));
+    let name = body.name.unwrap_or_else(|| vol_id.clone());
+    let rec = VolumeRec {
+        volume_id: vol_id.clone(),
+        name,
+        size_mb: body.size_mb.unwrap_or(1024),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = std::fs::create_dir_all(format!("{}/{}", VOLUMES_ROOT, vol_id));
+    state.volumes.insert(vol_id.clone(), rec.clone());
+    Ok((StatusCode::CREATED, Json(rec)))
+}
+
+async fn volumes_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<VolumeRec>>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    Ok(Json(state.volumes.iter().map(|r| r.value().clone()).collect()))
+}
+
+async fn volume_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vid): Path<String>,
+) -> Result<Json<VolumeRec>, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    let rec = state.volumes.get(&vid)
+        .map(|r| r.clone())
+        .ok_or((StatusCode::NOT_FOUND, format!("volume {} not found", vid)))?;
+    Ok(Json(rec))
+}
+
+async fn volume_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vid): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    check_api_key(&state, &headers).await?;
+    state.volumes.remove(&vid);
+    let _ = std::fs::remove_dir_all(format!("{}/{}", VOLUMES_ROOT, vid));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+
 // ---- main ---------------------------------------------------------------
 
 #[tokio::main]
@@ -1466,6 +1920,9 @@ async fn main() -> Result<()> {
         tos,
         template_builds: DashMap::new(),
         template_id_to_build: DashMap::new(),
+        template_tags: DashMap::new(),
+        volumes: DashMap::new(),
+        snapshots: DashMap::new(),
     });
     for rec in prior {
         let sid = rec.sandbox_id.clone();
@@ -1475,7 +1932,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(shim_health))
-        .route("/sandboxes", post(create_sandbox))
+        .route("/sandboxes", post(create_sandbox).get(sandboxes_list))
         .route("/sandboxes/:id", get(get_sandbox).delete(delete_sandbox))
         .route("/sandboxes/:id/timeout", post(set_sandbox_timeout))
         .route("/sandboxes/:id/snapshot", post(sandbox_snapshot))
@@ -1487,6 +1944,33 @@ async fn main() -> Result<()> {
         .route("/templates/:tid/builds/:bid", post(templates_build_start))
         .route("/templates/:tid/builds/:bid/status", get(templates_build_status))
         .route("/templates/:tid/builds/:bid/logs", get(templates_build_logs))
+        // Sandboxes — full E2B coverage (metadata-only for stateful ops)
+        .route("/sandboxes/list", get(sandboxes_list))   // some clients hit /list
+        .route("/v2/sandboxes", get(sandboxes_list))
+        .route("/sandboxes/metrics", get(sandboxes_metrics))
+        .route("/sandboxes/:id/metrics", get(sandbox_metrics_one))
+        .route("/sandboxes/:id/logs", get(sandbox_logs))
+        .route("/v2/sandboxes/:id/logs", get(sandbox_logs))
+        .route("/sandboxes/:id/pause", post(sandbox_pause))
+        .route("/sandboxes/:id/resume", post(sandbox_resume))
+        .route("/sandboxes/:id/connect", post(sandbox_connect))
+        .route("/sandboxes/:id/refreshes", post(sandbox_refreshes))
+        .route("/sandboxes/:id/snapshots", post(sandbox_snapshots_e2b))
+        // Templates — list/detail/alias/delete/update + older create endpoints
+        .route("/templates", get(templates_list).post(templates_create_legacy))
+        .route("/v2/templates", post(templates_create_legacy))
+        .route("/templates/:tid", get(template_get).delete(template_delete).post(template_update))
+        .route("/templates/:tid", axum::routing::patch(template_update))
+        .route("/v2/templates/:tid", axum::routing::patch(template_update))
+        .route("/templates/aliases/:alias", get(template_get_by_alias))
+        // Tags
+        .route("/templates/tags", post(tags_assign).delete(tags_remove))
+        .route("/templates/:tid/tags", get(tags_get))
+        // Snapshots
+        .route("/snapshots", get(snapshots_list))
+        // Volumes
+        .route("/volumes", post(volumes_create).get(volumes_list))
+        .route("/volumes/:vid", get(volume_get).delete(volume_delete))
         // Connect RPC paths (E2B SDK sends to {base_url}/process.Process/Start)
         .route("/process.Process/Start", post(process_start))
         .route("/process.Process/List", post(process_list))
