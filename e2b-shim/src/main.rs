@@ -22,7 +22,7 @@ use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use chrono::Utc;
@@ -273,6 +273,7 @@ struct NewSandbox {
     #[serde(default)]
     timeout: Option<u64>,
     #[serde(default)]
+    #[allow(dead_code)]
     env_vars: Option<serde_json::Value>,
 }
 
@@ -347,7 +348,7 @@ async fn create_sandbox(
 
     let sid = format!(
         "i{}",
-        uuid::Uuid::new_v4().to_string().replace('-', "")[..20].to_string()
+        &uuid::Uuid::new_v4().to_string().replace('-', "")[..20]
     );
     let now = Utc::now();
     let end = now + chrono::Duration::seconds(body.timeout.unwrap_or(900) as i64);
@@ -505,7 +506,7 @@ fn response_to_json(r: &pb::StartResponse) -> serde_json::Value {
 fn general_b64(b: &[u8]) -> String {
     // Standard base64 (proto3 JSON canonical encoding for bytes).
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((b.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= b.len() {
         let n = ((b[i] as u32) << 16) | ((b[i + 1] as u32) << 8) | (b[i + 2] as u32);
@@ -962,6 +963,7 @@ struct JsonPathRequest {
     #[serde(default)]
     destination: String,
     #[serde(default)]
+    #[allow(dead_code)]
     depth: u32,
 }
 
@@ -972,9 +974,9 @@ fn decode_unary_path_request(ct: &str, body: &[u8]) -> Option<JsonPathRequest> {
         Codec::Proto => {
             // We accept either Stat/MakeDir/Remove which all share `string path = 1`.
             // For Move use source=1 destination=2. We try a permissive decode.
-            let mut req = JsonPathRequest::default();
-            let mut buf = payload;
-            while !buf.is_empty() {
+            let req = JsonPathRequest::default();
+            let buf = payload;
+            if !buf.is_empty() {
                 let (tag, rest) =
                     match prost::encoding::decode_varint(&mut std::io::Cursor::new(buf)) {
                         Ok(v) => (v, buf),
@@ -982,7 +984,6 @@ fn decode_unary_path_request(ct: &str, body: &[u8]) -> Option<JsonPathRequest> {
                     };
                 let _ = (tag, rest);
                 // Too tedious to hand-decode; fallback: return Some empty so callers don't crash.
-                break;
             }
             Some(req)
         }
@@ -1002,7 +1003,7 @@ fn make_entry_info_json(path: &std::path::Path, root: &std::path::Path) -> serde
             } else {
                 0
             };
-            (m.len() as i64, m.permissions().mode() as u32, ft)
+            (m.len() as i64, m.permissions().mode(), ft)
         }
         None => (0i64, 0u32, 0),
     };
@@ -1468,6 +1469,7 @@ fn sanitize_name(raw: &str) -> String {
 }
 
 #[derive(Deserialize, Default)]
+#[allow(dead_code)]
 struct TemplateBuildRequestV3 {
     #[serde(default)]
     alias: Option<String>,
@@ -1519,12 +1521,6 @@ async fn templates_create_v3(
             "templateID": template_id,
         })),
     ))
-}
-
-#[derive(Deserialize)]
-struct FilesHashPath {
-    template_id: String,
-    hash: String,
 }
 
 async fn templates_files_hash(
@@ -1607,6 +1603,7 @@ async fn files_upload(
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct TemplateStepV2 {
     #[serde(rename = "type")]
     type_: String,
@@ -1619,6 +1616,7 @@ struct TemplateStepV2 {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct TemplateBuildStartV2 {
     #[serde(default)]
     force: bool,
@@ -1650,7 +1648,10 @@ async fn templates_build_start(
             format!("build {} not found", build_id),
         ))?;
     if tb.template_id != template_id {
-        return Err((StatusCode::BAD_REQUEST, format!("template/build mismatch")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "template/build mismatch".to_string(),
+        ));
     }
 
     // Materialise template dir + Dockerfile + template.toml + copy files.
@@ -2160,6 +2161,7 @@ async fn template_delete(
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 struct TemplateUpdate {
     #[serde(default)]
     public: Option<bool>,

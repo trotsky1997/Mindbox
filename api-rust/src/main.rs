@@ -1103,7 +1103,6 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
     )
 }
 
-use nix::sys::socket::ControlMessageOwned;
 use std::os::unix::io::AsRawFd as _AsRawFd;
 use std::os::unix::io::FromRawFd as _FromRawFd;
 use std::os::unix::io::RawFd as _RawFd;
@@ -1113,7 +1112,6 @@ use std::os::unix::io::RawFd as _RawFd;
 fn lease_child_fds_blocking(socket_path: &Path, count: usize) -> anyhow::Result<Vec<UnixStream>> {
     use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
     use std::io::IoSliceMut;
-    use std::io::Read as _;
     use std::io::Write as _;
 
     // Connect (blocking std stream).
