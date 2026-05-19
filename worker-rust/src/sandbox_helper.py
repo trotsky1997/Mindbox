@@ -65,6 +65,12 @@ _total_exec_ns = 0
 _total_gc_collected = 0
 _initial_thread_count = None
 _initial_fds = None
+# sys.modules snapshot taken on the first request in this child, AFTER fork
+# inherited the parent's prewarmed module set. Used to roll back imports
+# done by per-request user code so the next request gets a clean module
+# table (prewarmed modules stay; only entries added during the request
+# are dropped).
+_initial_sys_modules = None
 
 _MAX_REQS = int(os.environ.get('WORKER_REUSE_MAX_REQS', '200'))
 _MAX_RSS_MB = int(os.environ.get('WORKER_REUSE_MAX_RSS_MB', '1024'))
@@ -91,13 +97,36 @@ def _count_fds():
 
 
 def _ensure_init():
-    global _started_at, _initial_thread_count, _initial_fds
+    global _started_at, _initial_thread_count, _initial_fds, _initial_sys_modules
     if _started_at is None:
         _started_at = time.time()
     if _initial_thread_count is None:
         _initial_thread_count = threading.active_count()
     if _initial_fds is None:
         _initial_fds = _count_fds()
+    if _initial_sys_modules is None:
+        _initial_sys_modules = frozenset(sys.modules.keys())
+
+
+def _drop_request_modules(initial):
+    """Remove sys.modules entries added during the current request.
+
+    Anything that was in sys.modules at child-init time (the prewarmed set
+    inherited from the parent fork) stays; any module the user code
+    imported after that is purged so the next request sees a fresh
+    re-import (running the module's top-level code again).
+
+    Note: this does NOT reset attrs mutated on prewarmed modules
+    (e.g. `numpy.foo = bad` persists until the child is reaped at
+    _MAX_REQS). It only undoes the `import X` half of pollution.
+    """
+    if initial is None:
+        return
+    for name in [k for k in sys.modules.keys() if k not in initial]:
+        try:
+            del sys.modules[name]
+        except KeyError:
+            pass
 
 
 def _build_resp(stdout, stderr, exit_code, expire, expire_reason, output_files=None, deleted_files=None, output_files_b64=None):
@@ -263,6 +292,9 @@ def _run_sandbox_pb(job_bytes):
         if run_dir is not None:
             try: shutil.rmtree(run_dir, ignore_errors=True)
             except Exception: pass
+        # Roll back any `import X` the user code did this request so the
+        # next request on this child starts from the prewarmed module set.
+        _drop_request_modules(_initial_sys_modules)
 
     _total_exec_ns += time.monotonic_ns() - exec_start
     _requests_served += 1
