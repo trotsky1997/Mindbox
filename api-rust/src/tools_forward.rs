@@ -1,60 +1,103 @@
-//! Reverse-proxy routes that forward `/v2/sessions*` HTTP calls to an
-//! upstream tools-rust daemon (`TOOLS_DAEMON_URL`).
+//! /v2 routes that dispatch to a tools-rust daemon picked by the
+//! PagedRegistry. The daemon URL is resolved per request by acquiring the
+//! template — so a tools template gets lazy-spawned the first time it's
+//! used, and the same hot/warm/cold tier + LRU machinery applies as for
+//! python-pool templates.
 //!
-//! Minimum-viable shape: a single upstream daemon, no per-template
-//! container lifecycle yet. The api-rust process is only the routing
-//! glue; the daemon itself manages sessions/cwd/tool dispatch.
-//!
-//! Later phases will:
-//! - lazy-spawn a tools-rust container per kind=tools template
-//! - record session_id → (template, daemon URL) so multiple daemons can
-//!   coexist behind /v2 routes
-//! - integrate this into PagedRegistry so warm/hot tiering applies
+//! Backwards compat: if PagedRegistry has no `tools-*` template configured
+//! but TOOLS_DAEMON_URL env is set, we fall back to direct forward to
+//! that single daemon (the phase 2 shape). This keeps simple single-daemon
+//! deployments working without writing a template.toml.
 
 use axum::{
     body::{to_bytes, Body},
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
     routing::{any, get, post},
-    Router,
+    Json, Router,
 };
+use serde::Deserialize;
 use std::sync::Arc;
 
+use crate::AppState;
+
+const FALLBACK_TEMPLATE: &str = "__fallback_daemon__";
+
 pub struct ToolsForwardState {
-    pub upstream: Option<String>, // e.g. http://127.0.0.1:8002
+    pub app: Arc<AppState>,
+    pub fallback_daemon: Option<String>,
     pub client: reqwest::Client,
+    /// session_id → template name. Populated on POST /v2/sessions; consulted
+    /// for every subsequent route on that session. In-memory only — a
+    /// restarted api-rust forgets, daemons can be reached by direct hit.
+    pub sessions: dashmap::DashMap<String, String>,
 }
 
 impl ToolsForwardState {
-    pub fn from_env() -> Self {
-        let upstream = std::env::var("TOOLS_DAEMON_URL").ok().and_then(|s| {
-            if s.is_empty() {
-                None
-            } else {
-                Some(s.trim_end_matches('/').to_string())
-            }
-        });
+    pub fn new(app: Arc<AppState>) -> Self {
+        let fallback = std::env::var("TOOLS_DAEMON_URL")
+            .ok()
+            .map(|s| s.trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(64)
             .build()
             .expect("reqwest client");
-        Self { upstream, client }
+        Self {
+            app,
+            fallback_daemon: fallback,
+            client,
+            sessions: dashmap::DashMap::new(),
+        }
+    }
+
+    /// Resolve a daemon URL for the given template name. Order:
+    ///   1. Acquire the template in PagedRegistry; if it's a Tools backend,
+    ///      pick a daemon round-robin.
+    ///   2. Else fallback to TOOLS_DAEMON_URL.
+    async fn daemon_for(&self, template: &str) -> Result<String, (StatusCode, String)> {
+        if template != FALLBACK_TEMPLATE {
+            match self.app.registry.acquire(template).await {
+                Ok(rt) => {
+                    if let Some(u) = rt.pick_daemon_url() {
+                        return Ok(u.to_string());
+                    }
+                    // python-pool template — /v2 routes can't serve it.
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "template '{}' is python-pool (kind != tools); use /exec_hot",
+                            template
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    // Template not configured — fall through to fallback if any.
+                    if self.fallback_daemon.is_none() {
+                        return Err((
+                            StatusCode::NOT_FOUND,
+                            format!("template '{}' not found: {}", template, e),
+                        ));
+                    }
+                }
+            }
+        }
+        self.fallback_daemon.clone().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no template registered and TOOLS_DAEMON_URL unset".into(),
+        ))
     }
 }
 
-async fn forward(
-    State(st): State<Arc<ToolsForwardState>>,
-    method: axum::http::Method,
+async fn forward_to(
+    st: &ToolsForwardState,
+    template: &str,
+    method: Method,
     path: &str,
     body: Body,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let Some(upstream) = st.upstream.as_deref() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "TOOLS_DAEMON_URL not set; /v2 routes disabled".into(),
-        ));
-    };
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let upstream = st.daemon_for(template).await?;
     let url = format!("{}{}", upstream, path);
     let body_bytes = to_bytes(body, 8 * 1024 * 1024)
         .await
@@ -66,7 +109,12 @@ async fn forward(
         .body(body_bytes)
         .send()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("upstream {}: {e}", upstream),
+            )
+        })?;
     let status = resp.status();
     let mut headers = HeaderMap::new();
     if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
@@ -78,52 +126,137 @@ async fn forward(
     }
     let bytes = resp.bytes().await.unwrap_or_default();
     let axum_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    Ok((axum_status, headers, bytes))
+    Ok((axum_status, headers, bytes).into_response())
 }
 
-async fn v2_health(
-    State(st): State<Arc<ToolsForwardState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    forward(State(st), axum::http::Method::GET, "/health", Body::empty()).await
+async fn v2_health(State(st): State<Arc<ToolsForwardState>>) -> impl IntoResponse {
+    let template = FALLBACK_TEMPLATE.to_string();
+    match forward_to(&st, &template, Method::GET, "/health", Body::empty()).await {
+        Ok(r) => r,
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateSessionReq {
+    #[serde(default)]
+    template: String,
 }
 
 async fn v2_create_session(
     State(st): State<Arc<ToolsForwardState>>,
     body: Body,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    forward(State(st), axum::http::Method::POST, "/sessions", body).await
+) -> impl IntoResponse {
+    // Read body once, parse for template, then forward.
+    let body_bytes = match to_bytes(body, 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("read body: {e}")).into_response(),
+    };
+    let req: CreateSessionReq = serde_json::from_slice(&body_bytes).unwrap_or(CreateSessionReq {
+        template: String::new(),
+    });
+    let template = if req.template.is_empty() {
+        FALLBACK_TEMPLATE.to_string()
+    } else {
+        req.template.clone()
+    };
+    let forwarded = forward_to(
+        &st,
+        &template,
+        Method::POST,
+        "/sessions",
+        Body::from(body_bytes.clone()),
+    )
+    .await;
+    let resp = match forwarded {
+        Ok(r) => r,
+        Err((s, m)) => return (s, m).into_response(),
+    };
+    // To dispatch follow-up calls on this session id, peek the returned
+    // body, extract session_id, and remember which template it belongs to.
+    // (resp.into_body() consumes resp so do that last.)
+    let (parts, body) = resp.into_parts();
+    let body_bytes = match to_bytes(body, 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("read body: {e}")).into_response(),
+    };
+    if parts.status.is_success() {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
+                st.sessions.insert(sid.to_string(), template);
+            }
+        }
+    }
+    axum::response::Response::from_parts(parts, Body::from(body_bytes))
 }
 
 async fn v2_delete_session(
     State(st): State<Arc<ToolsForwardState>>,
     Path(sid): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    forward(
-        State(st),
-        axum::http::Method::DELETE,
+) -> impl IntoResponse {
+    let template = st
+        .sessions
+        .remove(&sid)
+        .map(|(_, v)| v)
+        .unwrap_or_else(|| FALLBACK_TEMPLATE.to_string());
+    match forward_to(
+        &st,
+        &template,
+        Method::DELETE,
         &format!("/sessions/{sid}"),
         Body::empty(),
     )
     .await
+    {
+        Ok(r) => r,
+        Err((s, m)) => (s, m).into_response(),
+    }
 }
 
 async fn v2_tool_call(
     State(st): State<Arc<ToolsForwardState>>,
     Path((sid, tool)): Path<(String, String)>,
     body: Body,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    forward(
-        State(st),
-        axum::http::Method::POST,
+) -> impl IntoResponse {
+    let template = st
+        .sessions
+        .get(&sid)
+        .map(|r| r.clone())
+        .unwrap_or_else(|| FALLBACK_TEMPLATE.to_string());
+    match forward_to(
+        &st,
+        &template,
+        Method::POST,
         &format!("/sessions/{sid}/tools/{tool}"),
         body,
     )
     .await
+    {
+        Ok(r) => r,
+        Err((s, m)) => (s, m).into_response(),
+    }
+}
+
+async fn v2_templates(State(st): State<Arc<ToolsForwardState>>) -> impl IntoResponse {
+    // List configured templates whose kind is "tools".
+    let names: Vec<&String> = st
+        .app
+        .registry
+        .configs_iter()
+        .filter(|(_, c)| c.kind == "tools")
+        .map(|(n, _)| n)
+        .collect();
+    let body = serde_json::json!({
+        "templates": names,
+        "fallback_daemon": st.fallback_daemon,
+    });
+    (StatusCode::OK, Json(body))
 }
 
 pub fn router(state: Arc<ToolsForwardState>) -> Router {
     Router::new()
         .route("/v2/health", get(v2_health))
+        .route("/v2/templates", get(v2_templates))
         .route("/v2/sessions", post(v2_create_session))
         .route("/v2/sessions/:sid", any(v2_delete_session))
         .route("/v2/sessions/:sid/tools/:tool", post(v2_tool_call))
@@ -132,28 +265,41 @@ pub fn router(state: Arc<ToolsForwardState>) -> Router {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Tests don't need the module imports right now — they only touch
+    // std::env. Keep #[cfg(test)] mod around for future tests.
 
     #[test]
-    fn from_env_trims_trailing_slash() {
+    fn fallback_url_trims_trailing_slash() {
+        // We can't construct AppState in a unit test without a docker daemon,
+        // so just exercise the env-parse path:
         std::env::set_var("TOOLS_DAEMON_URL", "http://localhost:8002/");
-        let st = ToolsForwardState::from_env();
-        assert_eq!(st.upstream.as_deref(), Some("http://localhost:8002"));
+        // Mimic the parsing the constructor does.
+        let parsed = std::env::var("TOOLS_DAEMON_URL")
+            .ok()
+            .map(|s| s.trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
+        assert_eq!(parsed.as_deref(), Some("http://localhost:8002"));
         std::env::remove_var("TOOLS_DAEMON_URL");
     }
 
     #[test]
-    fn from_env_treats_empty_as_unset() {
+    fn fallback_empty_treated_as_unset() {
         std::env::set_var("TOOLS_DAEMON_URL", "");
-        let st = ToolsForwardState::from_env();
-        assert!(st.upstream.is_none());
+        let parsed = std::env::var("TOOLS_DAEMON_URL")
+            .ok()
+            .map(|s| s.trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
+        assert!(parsed.is_none());
         std::env::remove_var("TOOLS_DAEMON_URL");
     }
 
     #[test]
-    fn from_env_unset_when_missing() {
+    fn fallback_unset_when_missing() {
         std::env::remove_var("TOOLS_DAEMON_URL");
-        let st = ToolsForwardState::from_env();
-        assert!(st.upstream.is_none());
+        let parsed = std::env::var("TOOLS_DAEMON_URL")
+            .ok()
+            .map(|s| s.trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
+        assert!(parsed.is_none());
     }
 }

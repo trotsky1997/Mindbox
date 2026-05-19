@@ -55,6 +55,11 @@ fn socket_root() -> &'static std::path::Path {
 #[derive(Deserialize, Debug, Clone)]
 struct TemplateConfig {
     name: String,
+    /// "python-pool" (worker-rust fork-pool, legacy) or "tools" (tools-rust
+    /// daemon for the 7-tool dispatcher). Decides which start_*_container
+    /// helper acquire() calls during cold start.
+    #[serde(default = "default_kind")]
+    kind: String,
     #[serde(default = "default_base_image")]
     #[allow(dead_code)]
     base_image: String,
@@ -63,6 +68,9 @@ struct TemplateConfig {
     #[serde(default)]
     #[allow(dead_code)]
     extra_pip: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    extra_apt: Vec<String>,
     #[serde(default = "default_pool_size")]
     pool_size: usize,
     #[serde(default = "default_containers")]
@@ -74,6 +82,9 @@ struct TemplateConfig {
     #[serde(default = "default_engine")]
     #[allow(dead_code)]
     engine: String,
+}
+fn default_kind() -> String {
+    "python-pool".into()
 }
 fn default_base_image() -> String {
     "python:3.12-slim".into()
@@ -134,18 +145,58 @@ struct ExecResponse {
 
 // ---- runtime state ------------------------------------------------------
 
+/// What a TemplateRuntime is actually backed by. python-pool uses unix
+/// socket + child fd pool (worker-rust); tools uses a list of HTTP daemon
+/// URLs (tools-rust).
+enum TemplateBackend {
+    PythonPool {
+        socket_paths: Vec<PathBuf>,
+        rr: AtomicUsize,
+    },
+    Tools {
+        daemon_urls: Vec<String>,
+        rr: AtomicUsize,
+    },
+}
+
 struct TemplateRuntime {
     cfg: TemplateConfig,
     #[allow(dead_code)]
     container_ids: Vec<String>,
-    socket_paths: Vec<PathBuf>,
-    rr: AtomicUsize,
     sem: Arc<Semaphore>,
+    backend: TemplateBackend,
 }
 impl TemplateRuntime {
+    /// PythonPool only — returns the next socket path round-robin.
+    /// Panics on Tools backend (exec_hot etc. should check kind first).
     fn pick_path(&self) -> &Path {
-        let i = self.rr.fetch_add(1, Ordering::Relaxed);
-        &self.socket_paths[i % self.socket_paths.len()]
+        match &self.backend {
+            TemplateBackend::PythonPool { socket_paths, rr } => {
+                let i = rr.fetch_add(1, Ordering::Relaxed);
+                &socket_paths[i % socket_paths.len()]
+            }
+            TemplateBackend::Tools { .. } => {
+                panic!("pick_path() called on Tools-backed template")
+            }
+        }
+    }
+    /// Tools only — returns the next daemon URL round-robin.
+    fn pick_daemon_url(&self) -> Option<&str> {
+        match &self.backend {
+            TemplateBackend::Tools { daemon_urls, rr } => {
+                let i = rr.fetch_add(1, Ordering::Relaxed);
+                Some(daemon_urls[i % daemon_urls.len()].as_str())
+            }
+            TemplateBackend::PythonPool { .. } => None,
+        }
+    }
+    /// All python-pool socket paths (worker unix sockets). Empty for Tools
+    /// backend — callers that loop over these just no-op on tools templates.
+    fn socket_paths(&self) -> &[PathBuf] {
+        match &self.backend {
+            TemplateBackend::PythonPool { socket_paths, .. } => socket_paths,
+            TemplateBackend::Tools { .. } => &[],
+        }
     }
 }
 
@@ -183,6 +234,12 @@ struct PagedRegistry {
 }
 
 impl PagedRegistry {
+    /// Iterate over (template_name, TemplateConfig) pairs. Used by
+    /// tools_forward to discover which templates are kind="tools".
+    fn configs_iter(&self) -> impl Iterator<Item = (&String, &TemplateConfig)> {
+        self.configs.iter()
+    }
+
     fn new(
         docker: Docker,
         configs: HashMap<String, TemplateConfig>,
@@ -293,29 +350,64 @@ impl PagedRegistry {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown template: {}", name))?;
         self.evict_hot_to_warm_if_needed_excluding(name).await;
-        let tag = format!("inspect-tpl-{}:latest", cfg.name);
-        if !docker_image_exists(&self.docker, &tag).await? {
-            return Err(anyhow::anyhow!(
-                "template {} image {} not built",
-                cfg.name,
-                tag
-            ));
-        }
+
         let mut container_ids = Vec::new();
-        let mut socket_paths = Vec::new();
-        for i in 0..cfg.containers {
-            let (cid, sock) = start_template_container(&self.docker, &cfg, i).await?;
-            wait_ready(&sock, std::time::Duration::from_secs(30)).await?;
-            container_ids.push(cid);
-            socket_paths.push(sock);
-        }
+        let backend = match cfg.kind.as_str() {
+            "tools" => {
+                let mut daemon_urls = Vec::new();
+                for i in 0..cfg.containers.max(1) {
+                    let (cid, url) = start_tools_container(&self.docker, &cfg, i).await?;
+                    container_ids.push(cid);
+                    daemon_urls.push(url);
+                }
+                TemplateBackend::Tools {
+                    daemon_urls,
+                    rr: std::sync::atomic::AtomicUsize::new(0),
+                }
+            }
+            "python-pool" | "" => {
+                let tag = format!("inspect-tpl-{}:latest", cfg.name);
+                if !docker_image_exists(&self.docker, &tag).await? {
+                    return Err(anyhow::anyhow!(
+                        "template {} image {} not built",
+                        cfg.name,
+                        tag
+                    ));
+                }
+                let mut socket_paths = Vec::new();
+                for i in 0..cfg.containers {
+                    let (cid, sock) = start_template_container(&self.docker, &cfg, i).await?;
+                    wait_ready(&sock, std::time::Duration::from_secs(30)).await?;
+                    container_ids.push(cid);
+                    socket_paths.push(sock);
+                }
+                TemplateBackend::PythonPool {
+                    socket_paths,
+                    rr: std::sync::atomic::AtomicUsize::new(0),
+                }
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "template {} has unknown kind '{}'",
+                    cfg.name,
+                    other
+                ));
+            }
+        };
+
+        // Concurrency budget: for python-pool, containers*pool_size sandboxes
+        // can run; for tools, the daemon multiplexes internally so we just
+        // cap by container count (one daemon process can serve thousands of
+        // sessions, but multiple daemon containers do scale linearly).
+        let concurrency = if matches!(backend, TemplateBackend::Tools { .. }) {
+            cfg.containers.max(1) * 1024
+        } else {
+            cfg.containers.max(1) * cfg.pool_size.max(1)
+        };
         let rt = Arc::new(TemplateRuntime {
-            sem: Arc::new(tokio::sync::Semaphore::new(
-                cfg.containers.max(1) * cfg.pool_size.max(1),
-            )),
+            sem: Arc::new(tokio::sync::Semaphore::new(concurrency)),
             container_ids,
-            socket_paths,
-            rr: std::sync::atomic::AtomicUsize::new(0),
+            backend,
             cfg,
         });
         {
@@ -751,6 +843,136 @@ async fn start_template_container(
     Ok((created.id, host_dir.join("worker.sock")))
 }
 
+/// Spawn a tools-rust daemon container for the given template. The image
+/// must be tagged `inspect-tpl-tools-<cfg.name>:latest` (template-builder
+/// `kind="tools"` adds the "tools-" prefix). The container exposes 8002 to
+/// a random host port; we read that back via docker inspect and return it
+/// as the daemon URL the api-rust /v2 forward should hit.
+async fn start_tools_container(
+    docker: &Docker,
+    cfg: &TemplateConfig,
+    idx: usize,
+) -> Result<(String, String)> {
+    let tag = format!("inspect-tpl-tools-{}:latest", cfg.name);
+    if !docker_image_exists(docker, &tag).await? {
+        return Err(anyhow!(
+            "template {} tools image {} not built (try template-build {})",
+            cfg.name,
+            tag,
+            cfg.name
+        ));
+    }
+
+    let mem = parse_memory(&cfg.memory_reservation)?;
+
+    let mut labels = HashMap::new();
+    labels.insert("inspect-api-hot".to_string(), "1".to_string());
+    labels.insert("inspect-tpl".to_string(), cfg.name.clone());
+    labels.insert("inspect-kind".to_string(), "tools".to_string());
+
+    // Map container :8002 → random host port. host_ip="127.0.0.1" keeps the
+    // port loopback-only (this is api-rust → daemon on the same host).
+    let mut port_bindings: HashMap<String, Option<Vec<bollard::models::PortBinding>>> =
+        HashMap::new();
+    port_bindings.insert(
+        "8002/tcp".to_string(),
+        Some(vec![bollard::models::PortBinding {
+            host_ip: Some("127.0.0.1".into()),
+            host_port: Some("".into()), // empty → docker picks a free port
+        }]),
+    );
+
+    let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
+    exposed_ports.insert("8002/tcp".to_string(), HashMap::new());
+
+    let config = bollard::container::Config::<String> {
+        image: Some(tag),
+        labels: Some(labels),
+        exposed_ports: Some(exposed_ports),
+        host_config: Some(HostConfig {
+            port_bindings: Some(port_bindings),
+            memory_reservation: Some(mem),
+            cpu_shares: Some(1024),
+            pids_limit: Some(cfg.pids_limit),
+            oom_score_adj: Some(500),
+            security_opt: Some(vec!["no-new-privileges".into()]),
+            // tools container needs network for /v2 forward over loopback;
+            // user code inside (via tools/bash) shouldn't see external
+            // network. Bridge default — operators can override.
+            network_mode: Some(
+                std::env::var("TOOLS_CONTAINER_NETWORK_MODE").unwrap_or_else(|_| "bridge".into()),
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let name = format!(
+        "mindbox-tpl-tools-{}-{}-{}",
+        cfg.name,
+        idx,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let created = docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: name.clone(),
+                ..Default::default()
+            }),
+            config,
+        )
+        .await
+        .context("create tools container")?;
+    docker
+        .start_container(&created.id, None::<StartContainerOptions<String>>)
+        .await
+        .context("start tools container")?;
+
+    // Inspect to learn the assigned host port.
+    let inspected = docker
+        .inspect_container(&created.id, None)
+        .await
+        .context("inspect tools container")?;
+    let host_port = inspected
+        .network_settings
+        .as_ref()
+        .and_then(|ns| ns.ports.as_ref())
+        .and_then(|p| p.get("8002/tcp").cloned().flatten())
+        .and_then(|v| v.into_iter().next())
+        .and_then(|pb| pb.host_port)
+        .ok_or_else(|| anyhow!("tools container has no published 8002/tcp port"))?;
+    let daemon_url = format!("http://127.0.0.1:{}", host_port);
+
+    // Wait for /health to return 200.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("reqwest client")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last_err: Option<String> = None;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "tools daemon at {} not ready in 30s: {}",
+                daemon_url,
+                last_err.unwrap_or_else(|| "no probe attempts".into())
+            ));
+        }
+        match client.get(format!("{}/health", daemon_url)).send().await {
+            Ok(r) if r.status().is_success() => {
+                eprintln!("[paged] tools daemon ready at {}", daemon_url);
+                return Ok((created.id, daemon_url));
+            }
+            Ok(r) => last_err = Some(format!("HTTP {}", r.status())),
+            Err(e) => last_err = Some(e.to_string()),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 async fn wait_ready(socket_path: &Path, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut last_err: Option<String> = None;
@@ -837,7 +1059,7 @@ async fn list_templates(State(state): State<Arc<AppState>>) -> impl IntoResponse
         let _is_hot = hot_set.contains(name);
         let mut idle = 0i64;
         if let Some(rt) = hot_map.get(name) {
-            for p in &rt.socket_paths {
+            for p in rt.socket_paths() {
                 let req = pb::Request {
                     cmd: "health".into(),
                     ..Default::default()
@@ -887,7 +1109,7 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         let mut agg_idle = 0u64;
         let mut agg_active = 0u64;
         let mut agg_respawns: HashMap<String, u64> = HashMap::new();
-        for p in &rt.socket_paths {
+        for p in rt.socket_paths() {
             let req = pb::Request {
                 cmd: "stats".into(),
                 ..Default::default()
@@ -938,7 +1160,7 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             name.clone(),
             json!({
                 "image": format!("inspect-tpl-{}:latest", name),
-                "containers": rt.socket_paths.len(),
+                "containers": rt.socket_paths().len(),
                 "pool_size": rt.cfg.pool_size,
                 "concurrency": rt.cfg.containers * rt.cfg.pool_size,
                 "prewarm": rt.cfg.prewarm,
@@ -977,7 +1199,7 @@ async fn admin_drain(
     let mut results = Vec::new();
     for tpl in templates_to_drain {
         if let Some(rt) = hot_map.get(&tpl) {
-            for p in &rt.socket_paths {
+            for p in rt.socket_paths() {
                 let req = pb::Request {
                     cmd: "drain".into(),
                     drain: Some(pb::DrainReq {
@@ -1026,7 +1248,7 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
             ki: 0,
             respawns: HashMap::new(),
         };
-        for p in &rt.socket_paths {
+        for p in rt.socket_paths() {
             let req = pb::Request {
                 cmd: "stats".into(),
                 ..Default::default()
@@ -1502,13 +1724,24 @@ async fn main() -> Result<()> {
         max_timeout,
     });
 
-    let tools_state = std::sync::Arc::new(tools_forward::ToolsForwardState::from_env());
-    if let Some(u) = tools_state.upstream.as_deref() {
-        eprintln!("[api] tools forward upstream = {}", u);
-    } else {
+    let tools_state = std::sync::Arc::new(tools_forward::ToolsForwardState::new(state.clone()));
+    let tools_template_count = state
+        .registry
+        .configs_iter()
+        .filter(|(_, c)| c.kind == "tools")
+        .count();
+    if let Some(u) = tools_state.fallback_daemon.as_deref() {
         eprintln!(
-            "[api] TOOLS_DAEMON_URL unset; /v2/* routes will respond 503 (set it to enable forward)"
+            "[api] tools forward: {} tools template(s) configured + fallback daemon {}",
+            tools_template_count, u
         );
+    } else if tools_template_count > 0 {
+        eprintln!(
+            "[api] tools forward: {} tools template(s) configured (lazy-spawned on demand)",
+            tools_template_count
+        );
+    } else {
+        eprintln!("[api] no tools templates configured and TOOLS_DAEMON_URL unset; /v2/* will 503");
     }
     let tools_router = tools_forward::router(tools_state);
 
