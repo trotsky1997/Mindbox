@@ -713,8 +713,6 @@ async fn tool_grep(
 ) -> Result<Json<GrepResp>, (StatusCode, String)> {
     let cwd = resolve_session(&state, &sid)?.clone();
     let target = resolve_in(&cwd, &req.path)?;
-    let re = regex::Regex::new(&req.pattern)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad regex: {e}")))?;
 
     let want_content = req.output_mode == "content";
     let want_files = req.output_mode == "files_with_matches";
@@ -729,63 +727,132 @@ async fn tool_grep(
         ));
     }
 
+    let pattern = req.pattern.clone();
+    let mode = req.output_mode.clone();
+    let max_files = req.max_files;
+
+    // Drive ripgrep's Sink API on a blocking thread so the daemon's main
+    // tokio runtime stays free to serve other tools.
+    let cwd_clone = cwd.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        run_ripgrep_search(
+            &target,
+            &cwd_clone,
+            &pattern,
+            &mode,
+            max_files,
+            want_content,
+            want_files,
+            want_count,
+        )
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))??;
+
+    Ok(Json(GrepResp {
+        mode: req.output_mode,
+        matches: result.matches,
+        files: result.files,
+        counts: result.counts,
+        walked: result.walked,
+        truncated: result.truncated,
+    }))
+}
+
+struct RipgrepResult {
+    matches: Vec<GrepMatch>,
+    files: Vec<String>,
+    counts: Vec<(String, u64)>,
+    walked: usize,
+    truncated: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_ripgrep_search(
+    target: &std::path::Path,
+    cwd: &std::path::Path,
+    pattern: &str,
+    _mode: &str,
+    max_files: usize,
+    want_content: bool,
+    want_files: bool,
+    want_count: bool,
+) -> Result<RipgrepResult, (StatusCode, String)> {
+    use grep::regex::RegexMatcher;
+    use grep::searcher::sinks::UTF8;
+    use grep::searcher::SearcherBuilder;
+
+    let matcher = RegexMatcher::new(pattern)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad regex: {e}")))?;
+
     let mut walked = 0usize;
     let mut truncated = false;
     let mut matches = Vec::<GrepMatch>::new();
     let mut files = Vec::<String>::new();
     let mut counts = Vec::<(String, u64)>::new();
 
-    let walker = walkdir::WalkDir::new(&target)
+    let walker = ignore::WalkBuilder::new(target)
         .follow_links(false)
-        .into_iter()
-        .filter_map(|r| r.ok())
-        .filter(|e| e.file_type().is_file());
+        .standard_filters(false) // don't auto-skip .gitignore'd files
+        .build();
 
-    for ent in walker {
+    for ent in walker.flatten() {
+        if !ent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
         walked += 1;
-        if walked > req.max_files {
+        if walked > max_files {
             truncated = true;
             break;
         }
         let path = ent.path();
-        let rel = match path.strip_prefix(&cwd) {
+        let rel = match path.strip_prefix(cwd) {
             Ok(p) => p.to_string_lossy().into_owned(),
             Err(_) => path.to_string_lossy().into_owned(),
         };
-        let body = match tokio::fs::read_to_string(path).await {
-            Ok(b) => b,
-            Err(_) => continue, // binary/permission/etc — skip
-        };
+
         let mut per_file = 0u64;
-        for (i, line) in body.lines().enumerate() {
-            if re.is_match(line) {
+        let mut searcher = SearcherBuilder::new()
+            .binary_detection(grep::searcher::BinaryDetection::quit(b'\x00'))
+            .line_number(true)
+            .build();
+
+        let rel_for_sink = rel.clone();
+        let collect_content = want_content;
+        let result = searcher.search_path(
+            &matcher,
+            path,
+            UTF8(|line_num, line| {
                 per_file += 1;
-                if want_content {
+                if collect_content {
                     matches.push(GrepMatch {
-                        path: rel.clone(),
-                        line: (i + 1) as u64,
-                        text: line.to_string(),
+                        path: rel_for_sink.clone(),
+                        line: line_num,
+                        text: line.trim_end_matches('\n').to_string(),
                     });
                 }
-            }
+                Ok(true)
+            }),
+        );
+        // Errors (binary detected, read errors) → just skip this file.
+        if result.is_err() {
+            continue;
         }
         if per_file > 0 {
             if want_files {
-                files.push(rel.clone());
+                files.push(rel);
             } else if want_count {
-                counts.push((rel.clone(), per_file));
+                counts.push((rel, per_file));
             }
         }
     }
-
-    Ok(Json(GrepResp {
-        mode: req.output_mode,
+    Ok(RipgrepResult {
         matches,
         files,
         counts,
         walked,
         truncated,
-    }))
+    })
 }
 
 async fn tool_find(
