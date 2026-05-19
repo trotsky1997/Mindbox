@@ -64,6 +64,17 @@ fn build(root: &Path, name: &str) -> Result<()> {
     if !toml_path.exists() {
         return Err(anyhow!("missing {}", toml_path.display()));
     }
+    // If a docker-compose.yml (or compose.yaml) is present, hand the build off
+    // to `docker compose build`. The compose file gets the working dir copy
+    // of worker-rust/inspect_pb2.py + access to env INSPECT_TPL_NAME / TAG.
+    let compose_yml = tpl_dir.join("docker-compose.yml");
+    let compose_yaml = tpl_dir.join("compose.yaml");
+    let compose_path = if compose_yml.exists() { Some(compose_yml) }
+                       else if compose_yaml.exists() { Some(compose_yaml) }
+                       else { None };
+    if let Some(p) = compose_path {
+        return build_via_compose(root, &tpl_dir, name, &p);
+    }
     let cfg: TemplateCfg = toml::from_str(
         &fs::read_to_string(&toml_path).with_context(|| format!("read {}", toml_path.display()))?,
     ).with_context(|| format!("parse {}", toml_path.display()))?;
@@ -138,6 +149,82 @@ fn build(root: &Path, name: &str) -> Result<()> {
         return Err(anyhow!("docker build failed (exit {:?})", status.code()));
     }
     println!("=== built {} ===", tag);
+    Ok(())
+}
+
+fn build_via_compose(root: &Path, tpl_dir: &Path, name: &str, compose_path: &Path) -> Result<()> {
+    let tag = format!("inspect-tpl-{}:latest", name);
+    let worker_bin = root.join("worker-rust/target/release/worker-rust");
+    let proto_py = root.join("proto/inspect_pb2.py");
+    if !worker_bin.exists() {
+        return Err(anyhow!(
+            "missing rust binary at {}; run `cargo build --release` in worker-rust/ first",
+            worker_bin.display()
+        ));
+    }
+    if !proto_py.exists() {
+        return Err(anyhow!(
+            "missing {}; run `protoc --python_out=. inspect.proto` in proto/ first",
+            proto_py.display()
+        ));
+    }
+
+    // Sanity check: docker compose plugin available.
+    let probe = Command::new("docker").args(["compose", "version"]).output();
+    match probe {
+        Ok(o) if o.status.success() => {}
+        _ => return Err(anyhow!(
+            "`docker compose` not available. Install the compose plugin \
+             (apt-get install docker-compose-plugin) or use a docker that bundles it."
+        )),
+    }
+
+    // Stage a build context: copy worker binary + pb2.py + every file from
+    // the template dir (Dockerfile, compose file, helper scripts, etc.) into
+    // a tempdir. compose's `context: .` then resolves correctly.
+    let bd = tempfile::tempdir().context("mktempdir")?;
+    let bd_path = bd.path();
+    let bin_dst = bd_path.join("worker-rust");
+    fs::copy(&worker_bin, &bin_dst).context("copy worker binary")?;
+    fs::set_permissions(&bin_dst, fs::Permissions::from_mode(0o755))?;
+    fs::copy(&proto_py, bd_path.join("inspect_pb2.py")).context("copy inspect_pb2.py")?;
+    for entry in fs::read_dir(tpl_dir).context("read tpl_dir")? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = bd_path.join(entry.file_name());
+        let meta = entry.metadata()?;
+        if meta.is_file() {
+            fs::copy(&src, &dst).with_context(|| format!("copy {}", src.display()))?;
+        }
+    }
+
+    let compose_in_ctx = bd_path.join(compose_path.file_name().unwrap());
+    println!("[compose] context={} file={}", bd_path.display(), compose_in_ctx.display());
+    println!("[compose] INSPECT_TPL_NAME={} INSPECT_TPL_TAG={}", name, tag);
+
+    let status = Command::new("docker")
+        .args(["compose", "-f"]).arg(&compose_in_ctx)
+        .args(["build"])
+        .env("INSPECT_TPL_NAME", name)
+        .env("INSPECT_TPL_TAG", &tag)
+        .status()
+        .context("spawn docker compose build")?;
+    if !status.success() {
+        return Err(anyhow!("docker compose build failed (exit {:?})", status.code()));
+    }
+
+    // Verify the expected tag exists.
+    let inspect = Command::new("docker").args(["image", "inspect", &tag])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status();
+    match inspect {
+        Ok(s) if s.success() => println!("=== built {} via compose ===", tag),
+        _ => return Err(anyhow!(
+            "docker compose build succeeded but tag '{}' was not produced.\n\
+             Ensure your compose file's service has `image: {}` (or use `${{INSPECT_TPL_TAG}}`).",
+            tag, tag
+        )),
+    }
     Ok(())
 }
 

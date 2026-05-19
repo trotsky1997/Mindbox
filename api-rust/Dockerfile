@@ -19,7 +19,7 @@
 #     -e INSPECT_API_TEMPLATES_DIR=/opt/inspect-api/templates \
 #     mindbox-api
 
-FROM rust:1-slim AS build
+FROM rust:1-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler libprotobuf-dev pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*

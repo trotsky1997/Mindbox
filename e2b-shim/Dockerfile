@@ -13,7 +13,7 @@
 #     -v /var/lib/e2b-shim:/var/lib/e2b-shim \
 #     mindbox-shim
 
-FROM rust:1-slim AS build
+FROM rust:1-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler libprotobuf-dev pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*

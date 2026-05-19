@@ -24,24 +24,40 @@
 #     -e E2B_SHIM_UPSTREAM=http://api-host:8000 \
 #     mindbox
 
-FROM rust:1-slim AS build
+FROM rust:1-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler libprotobuf-dev pkg-config libssl-dev \
+        python3-dev libpython3-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY proto/ ./proto/
 COPY api-rust/ ./api-rust/
 COPY e2b-shim/ ./e2b-shim/
+COPY template-builder/ ./template-builder/
+COPY worker-rust/ ./worker-rust/
 RUN cd api-rust && cargo build --release
 RUN cd e2b-shim && cargo build --release
+RUN cd template-builder && cargo build --release
+RUN cd worker-rust && cargo build --release
 
 FROM debian:bookworm-slim
+ARG COMPOSE_VERSION=v2.32.4
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates tini bash \
-    && rm -rf /var/lib/apt/lists/*
+        ca-certificates tini bash docker.io curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /usr/local/lib/docker/cli-plugins \
+    && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose \
+       https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64 \
+    && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 COPY --from=build /src/api-rust/target/release/api-rust /usr/local/bin/api-rust
 COPY --from=build /src/e2b-shim/target/release/e2b-shim /usr/local/bin/e2b-shim
-RUN mkdir -p /var/lib/e2b-shim/registry /var/lib/e2b-shim/sandboxes
+COPY --from=build /src/template-builder/target/release/template-build /usr/local/bin/template-build
+# template-build builds template images by copying the worker binary +
+# generated pb2.py into a temp build context. Keep them at the same paths
+# the binary expects on bare-metal install (/opt/inspect-api/...).
+COPY --from=build /src/worker-rust/target/release/worker-rust /opt/inspect-api/worker-rust/target/release/worker-rust
+COPY proto/inspect_pb2.py /opt/inspect-api/proto/inspect_pb2.py
+RUN mkdir -p /var/lib/e2b-shim/registry /var/lib/e2b-shim/sandboxes /opt/inspect-api/templates
 COPY <<'ENTRY' /usr/local/bin/mindbox-entrypoint
 #!/bin/bash
 set -e
