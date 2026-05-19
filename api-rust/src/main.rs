@@ -32,7 +32,21 @@ pub mod pb {
 use axum::extract::Path as AxumPath;
 
 const MAX_FRAME: usize = 64 * 1024 * 1024;
-const SOCKET_ROOT: &str = "/opt/inspect-api/sockets";
+/// Returns the per-template socket parent directory. Configured via
+/// INSPECT_API_SOCKETS_DIR; defaults to /opt/inspect-api/sockets. The
+/// path MUST be visible to the docker daemon (in dev-container deployments
+/// where the mindbox container runs against a path-rewriting docker proxy,
+/// pick a path the proxy can resolve — e.g. /tmp/inspect-api/sockets).
+fn socket_root() -> &'static std::path::Path {
+    use std::sync::LazyLock;
+    static ROOT: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
+        std::path::PathBuf::from(
+            std::env::var("INSPECT_API_SOCKETS_DIR")
+                .unwrap_or_else(|_| "/opt/inspect-api/sockets".into()),
+        )
+    });
+    &ROOT
+}
 
 // ---- config types --------------------------------------------------------
 
@@ -583,7 +597,7 @@ async fn cleanup_old_hot_containers(docker: &Docker) -> Result<()> {
                 .await;
         }
     }
-    if let Ok(entries) = std::fs::read_dir(SOCKET_ROOT) {
+    if let Ok(entries) = std::fs::read_dir(socket_root()) {
         for e in entries.flatten() {
             let _ = std::fs::remove_dir_all(e.path());
         }
@@ -623,7 +637,7 @@ async fn start_template_container(
             .unwrap()
             .as_nanos()
     );
-    let host_dir = PathBuf::from(SOCKET_ROOT).join(&dir_id);
+    let host_dir = socket_root().join(&dir_id);
     std::fs::create_dir_all(&host_dir)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&host_dir, std::fs::Permissions::from_mode(0o777))?;
@@ -1433,7 +1447,7 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
 
-    let _ = std::fs::create_dir_all(SOCKET_ROOT);
+    let _ = std::fs::create_dir_all(socket_root());
 
     let configs = load_templates(&templates_dir)?;
     eprintln!("[api] loaded {} template configs", configs.len());

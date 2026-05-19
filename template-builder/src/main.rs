@@ -15,9 +15,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ROOT: &str = "/opt/inspect-api";
-// Public default. Override with PIP_INDEX_URL env var for a regional mirror.
-const DEFAULT_PIP_INDEX: &str = "https://pypi.org/simple/";
-const DEFAULT_PIP_TRUSTED: &str = "pypi.org";
+// Default to the Volcano Engine intranet pip mirror. The standard
+// deployment target is Volcano ECS + Volcano CR, where this URL resolves
+// over the internal network — order(s) of magnitude faster than pypi.org.
+// Override with PIP_INDEX_URL / PIP_TRUSTED_HOST when building elsewhere
+// (laptop, CI, other cloud).
+const DEFAULT_PIP_INDEX: &str = "https://mirrors.ivolces.com/pypi/simple/";
+const DEFAULT_PIP_TRUSTED: &str = "mirrors.ivolces.com";
 const PROTOBUF_PIN: &str = "protobuf";
 
 #[derive(Debug, Parser)]
@@ -108,6 +112,10 @@ fn build(root: &Path, name: &str) -> Result<()> {
     let pip_index = std::env::var("PIP_INDEX_URL").unwrap_or_else(|_| DEFAULT_PIP_INDEX.into());
     let pip_trusted =
         std::env::var("PIP_TRUSTED_HOST").unwrap_or_else(|_| DEFAULT_PIP_TRUSTED.into());
+    // npm/bun registry mirror. Defaults to /npm/ on the same Volcano host
+    // (override with NPM_REGISTRY_URL for a different registry).
+    let npm_registry = std::env::var("NPM_REGISTRY_URL")
+        .unwrap_or_else(|_| format!("https://{}/npm/", pip_trusted));
 
     let bd = tempfile::tempdir().context("mktempdir")?;
     let bd_path = bd.path();
@@ -130,6 +138,7 @@ fn build(root: &Path, name: &str) -> Result<()> {
         format!(
             "FROM {base}\n\
              WORKDIR /\n\
+             ENV PIP_INDEX_URL=\"{pip_idx}\" PIP_TRUSTED_HOST=\"{pip_trust}\" UV_INDEX_URL=\"{pip_idx}\" UV_INDEX_STRATEGY=\"unsafe-best-match\" npm_config_registry=\"{npm_reg}\" BUN_CONFIG_REGISTRY=\"{npm_reg}\"\n\
              RUN pip install --no-cache-dir --index-url {pip_idx} --trusted-host {pip_trust} {pkgs}\n\
              ENV WORKER_PREWARM_MODULES=\"{prewarm_csv}\"\n\
              ENV WORKER_POOL_SIZE=\"{pool}\"\n\
@@ -141,6 +150,7 @@ fn build(root: &Path, name: &str) -> Result<()> {
             base = cfg.base_image,
             pip_idx = pip_index,
             pip_trust = pip_trusted,
+            npm_reg = npm_registry,
             pkgs = pkgs.join(" "),
             prewarm_csv = prewarm_csv,
             pool = cfg.pool_size,

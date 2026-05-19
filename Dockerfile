@@ -24,6 +24,12 @@
 #     -e E2B_SHIM_UPSTREAM=http://api-host:8000 \
 #     mindbox
 
+# IMPORTANT: this builder ships Python 3.11. The worker-rust binary built
+# here links to libpython3.11.so via PyO3. Any template image
+# (templates/*/template.toml `base_image`) MUST also ship Python 3.11 or
+# the worker container will die on startup with
+# "libpython3.11.so.1.0: cannot open shared object file".
+# If you upgrade this base image, audit every template.toml `base_image`.
 FROM rust:1-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler libprotobuf-dev pkg-config libssl-dev \

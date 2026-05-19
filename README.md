@@ -127,6 +127,7 @@ cd worker-rust && cargo build --release
 |---|---|---|
 | `PORT` | 8000 | HTTP port |
 | `INSPECT_API_TEMPLATES_DIR` | `/opt/inspect-api/templates` | template scan dir |
+| `INSPECT_API_SOCKETS_DIR` | `/opt/inspect-api/sockets` | parent dir for per-template worker unix sockets. Must be a path the docker daemon can resolve (in dev-container deployments behind a path-rewriting docker proxy, prefer `/tmp/inspect-api/sockets` or another host-visible mount). |
 | `INSPECT_API_MAX_TIMEOUT` | 60 | max user code timeout (seconds) |
 
 ### worker-rust (baked into image via Dockerfile from template.toml)
@@ -142,6 +143,16 @@ cd worker-rust && cargo build --release
 | `WORKER_REAPER_INTERVAL_SEC` | 5 | reaper scan period |
 | `WORKER_MAX_TOTAL_RSS_MB` | 0 (off) | reaper drains oldest if total idle RSS exceeds |
 | `WORKER_GC_EVERY_N` | 5 | `gc.collect()` every N requests in each child |
+
+### template-build (build-time)
+| Var | Default | Purpose |
+|---|---|---|
+| `PIP_INDEX_URL` | `https://mirrors.ivolces.com/pypi/simple/` | pip index. Default is the Volcano Engine intranet mirror (this is the primary deployment target). Set to `https://pypi.org/simple/` or a regional mirror when building outside Volcano ECS. |
+| `PIP_TRUSTED_HOST` | `mirrors.ivolces.com` | passed to `pip install --trusted-host`. |
+| `NPM_REGISTRY_URL` | `https://<pip_trusted>/npm/` | injected into the worker image as `npm_config_registry` + `BUN_CONFIG_REGISTRY` for runtime npm/bun installs from sandbox code. |
+| `REGISTRY_HOST` / `REGISTRY_NAMESPACE` | (none) | required for `--push`; image is tagged `<host>/<ns>/inspect-tpl-<name>:<sha>`. |
+
+Worker images also bake `PIP_INDEX_URL`, `PIP_TRUSTED_HOST`, `UV_INDEX_URL`, `UV_INDEX_STRATEGY=unsafe-best-match`, `npm_config_registry`, and `BUN_CONFIG_REGISTRY` as image-level `ENV`, so any pip/uv/npm/bun install run inside a sandbox (from user code) goes through the same mirror by default.
 
 
 ## Wire protocol (api ↔ worker)
@@ -273,6 +284,27 @@ code is hanging past `timeout+5s` and forcing parent SIGKILL.
 
 **Empty `/health`:** the tmux session may have died. `status.sh` or
 `tmux attach -t inspect-api` to see what happened.
+
+**`acquire template ...: socket ... did not appear` (30s):** the worker container
+either didn't start or started and immediately crashed. Diagnose by running
+`docker logs <newest worker container>`:
+- `libpython3.X.so.1.0: cannot open shared object file` → the template's
+  `base_image` Python version doesn't match the mindbox builder's Python
+  (3.11 currently). Edit `templates/<name>/template.toml` to use
+  `python:3.11-slim` and rerun `template-build <name>`.
+- nothing at all in `docker ps` → docker daemon refused the bind mount.
+  Confirm `INSPECT_API_SOCKETS_DIR` points to a host-visible path. In
+  dev-container deployments where mindbox runs inside another container
+  behind a path-rewriting docker proxy, the default `/opt/inspect-api/sockets`
+  lives in an overlay layer the host docker can't see; pick a path that's a
+  real host bind mount (commonly `/tmp/inspect-api/sockets`).
+
+**Running mindbox inside a dev container with sshd/code-server:** the
+mindbox image's entrypoint is `mindbox-entrypoint` (tini → api-rust + e2b-shim).
+If you layer the image on top of a `supervisord`-managed dev environment, you
+must add a supervisord program entry that runs `/usr/local/bin/mindbox-entrypoint`
+(with `.env` sourced first), otherwise the API/shim binaries never start and
+`docker run` from outside sees `127.0.0.1:8000/health` returning HTTP 000.
 
 ## E2B-compatible shim (e2b-shim on :8001)
 

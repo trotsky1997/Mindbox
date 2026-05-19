@@ -1,6 +1,12 @@
 name = "data-science"
-base_image = "python:3.12-slim"
-prewarm = []
+# Python version MUST match the mindbox image's builder (rust:1-slim-bookworm
+# ships Python 3.11). Mismatch → worker-rust binary fails to load libpython
+# inside the worker container.
+base_image = "python:3.11-slim"
+# Preload heavy modules in the worker parent process so child forks
+# inherit already-imported state. Cuts cold-fork latency from ~600ms
+# (numpy import) to <1ms per request.
+prewarm = ["numpy"]
 extra_pip = ["numpy", "pandas"]
 pool_size = 32
 containers = 4
