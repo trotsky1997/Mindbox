@@ -35,7 +35,17 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 // ---------------------------------------------------------------------------
 
 pub struct AppState {
+    /// Top-level sandbox storage (TOOLS_SANDBOX_ROOT env). When chroot
+    /// isolation is off, this is also where sessions live.
     sandbox_root: PathBuf,
+    /// Parent dir of each session's cwd. Equals sandbox_root when chroot
+    /// is off; equals sandbox_root/.rootfs/sessions when chroot is on.
+    session_root: PathBuf,
+    /// When Some, every tool_bash subprocess chroots into this dir
+    /// and chdirs to /sessions/<sid>. session_root is then a child of
+    /// chroot_root so the daemon-side filesystem operations and the
+    /// chroot-side bash view see the same files (via the same inodes).
+    chroot_root: Option<PathBuf>,
     sessions: DashMap<String, PathBuf>,
     isolation: IsolationCfg,
     seccomp_filter: Option<Arc<seccompiler::BpfProgram>>,
@@ -215,6 +225,152 @@ unsafe fn apply_bash_isolation(filter: &seccompiler::BpfProgram) -> std::io::Res
     }
     seccompiler::apply_filter(filter)
         .map_err(|e| std::io::Error::other(format!("apply_filter: {e}")))?;
+    Ok(())
+}
+
+/// Set of binaries copied into the shared chroot rootfs. The full ldd
+/// transitive closure of each binary gets pulled in too, so bash + the
+/// listed coreutils have their shared libraries available post-chroot.
+const ROOTFS_BINARIES: &[&str] = &[
+    "/bin/bash",
+    "/bin/sh",
+    "/bin/ls",
+    "/bin/cat",
+    "/bin/cp",
+    "/bin/mv",
+    "/bin/rm",
+    "/bin/mkdir",
+    "/bin/echo",
+    "/bin/grep",
+    "/bin/sed",
+    "/bin/awk",
+    "/bin/sort",
+    "/bin/head",
+    "/bin/tail",
+    "/bin/wc",
+    "/usr/bin/python3",
+    "/usr/bin/node",
+    "/usr/bin/git",
+    "/usr/bin/rg",
+    "/usr/bin/fd",
+    "/usr/bin/fdfind",
+    "/usr/bin/uname",
+    "/usr/bin/which",
+    "/usr/bin/env",
+    "/usr/bin/find",
+    "/usr/bin/diff",
+];
+
+/// Prepare a shared sub-rootfs at `rootfs` so bash subprocesses can chroot
+/// into it. Idempotent: skips if `rootfs/bin/bash` already exists. Pulls
+/// in each binary in ROOTFS_BINARIES (best-effort: missing ones are fine)
+/// plus their ldd-resolved shared libraries plus a handful of /etc files
+/// bash + glibc commonly read.
+///
+/// Cost: typically 30-100 MB of file copies + ldd subprocess invocations.
+/// Done once at daemon startup, not per session.
+fn prepare_shared_rootfs(rootfs: &std::path::Path) -> std::io::Result<()> {
+    use std::process::Command as StdCommand;
+    if rootfs.join("bin/bash").exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(rootfs)?;
+    for dir in [
+        "bin",
+        "usr/bin",
+        "lib",
+        "lib/x86_64-linux-gnu",
+        "lib64",
+        "etc",
+        "sessions",
+        "tmp",
+    ] {
+        std::fs::create_dir_all(rootfs.join(dir))?;
+    }
+    // /tmp is writable for bash; everyone read+write+sticky.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(rootfs.join("tmp"), std::fs::Permissions::from_mode(0o1777))?;
+
+    let mut copied_libs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let copy_one = |src: &std::path::Path, dst: &std::path::Path| -> std::io::Result<()> {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+        Ok(())
+    };
+
+    for bin in ROOTFS_BINARIES {
+        let src = std::path::Path::new(bin);
+        if !src.exists() {
+            continue; // template-specific binaries may not be on every host
+        }
+        let dst = rootfs.join(bin.trim_start_matches('/'));
+        if let Err(e) = copy_one(src, &dst) {
+            tracing::warn!("chroot rootfs: copy {} failed: {}", bin, e);
+            continue;
+        }
+        // ldd to find transitive shared lib deps. Best-effort: if ldd
+        // fails or the binary is statically linked we just skip libs for it.
+        if let Ok(out) = StdCommand::new("ldd").arg(bin).output() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                for tok in line.split_whitespace() {
+                    if !tok.starts_with('/') {
+                        continue;
+                    }
+                    if !copied_libs.insert(tok.to_string()) {
+                        continue;
+                    }
+                    let lib_src = std::path::Path::new(tok);
+                    if !lib_src.is_file() {
+                        continue;
+                    }
+                    let lib_dst = rootfs.join(tok.trim_start_matches('/'));
+                    let _ = copy_one(lib_src, &lib_dst);
+                }
+            }
+        }
+    }
+
+    // glibc resolver helpers + nsswitch + minimal /etc files bash touches.
+    for f in [
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/nsswitch.conf",
+        "/etc/resolv.conf",
+        "/etc/hosts",
+        "/etc/ld.so.cache",
+    ] {
+        let src = std::path::Path::new(f);
+        if src.exists() {
+            let _ = copy_one(src, &rootfs.join(f.trim_start_matches('/')));
+        }
+    }
+    tracing::info!(
+        "prepared chroot rootfs at {} ({} unique libs)",
+        rootfs.display(),
+        copied_libs.len()
+    );
+    Ok(())
+}
+
+/// Apply chroot then chdir into the in-chroot session path. Called from
+/// the bash subprocess pre_exec hook in addition to (or in place of) the
+/// seccomp variant. Uses raw libc::chroot + libc::chdir for async-signal-
+/// safety (no allocations after fork).
+///
+/// # Safety
+/// Must run between fork and exec. cstr must be a null-terminated C string.
+unsafe fn apply_chroot(
+    rootfs: *const libc::c_char,
+    cwd_in_chroot: *const libc::c_char,
+) -> std::io::Result<()> {
+    if unsafe { libc::chroot(rootfs) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::chdir(cwd_in_chroot) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -416,7 +572,7 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CreateSessionResp>, (StatusCode, String)> {
     let id = Uuid::new_v4().simple().to_string();
-    let cwd = state.sandbox_root.join(&id);
+    let cwd = state.session_root.join(&id);
     tokio::fs::create_dir_all(&cwd)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}")))?;
@@ -682,17 +838,43 @@ async fn tool_bash(
 ) -> Result<Json<BashResp>, (StatusCode, String)> {
     let cwd = resolve_session(&state, &sid)?.clone();
     let mut cmd = Command::new("/bin/bash");
-    cmd.arg("-c").arg(&req.cmd).current_dir(&cwd);
+    cmd.arg("-c").arg(&req.cmd);
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    if let Some(filter) = state.seccomp_filter.clone() {
-        // SAFETY: pre_exec runs post-fork, pre-exec — apply_bash_isolation
-        // only does prctl(PR_SET_NO_NEW_PRIVS) and seccompiler::apply_filter,
-        // both async-signal-safe per their docs.
+    // chroot path: don't set current_dir() — pre_exec chroots first and
+    // then chdirs to the in-chroot session path. Without chroot, set
+    // current_dir() to the daemon-side cwd as before.
+    let chroot_data: Option<(std::ffi::CString, std::ffi::CString)> =
+        match state.chroot_root.as_ref() {
+            Some(rootfs) => {
+                let rootfs_c = std::ffi::CString::new(rootfs.to_string_lossy().as_bytes())
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cstr: {e}")))?;
+                let cwd_in_chroot = std::ffi::CString::new(format!("/sessions/{}", sid))
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cstr: {e}")))?;
+                Some((rootfs_c, cwd_in_chroot))
+            }
+            None => {
+                cmd.current_dir(&cwd);
+                None
+            }
+        };
+    let filter = state.seccomp_filter.clone();
+    if chroot_data.is_some() || filter.is_some() {
+        // SAFETY: pre_exec runs post-fork, pre-execve. The operations we
+        // perform — libc::chroot, libc::chdir, prctl, seccomp filter
+        // install — are all documented async-signal-safe.
         unsafe {
-            cmd.pre_exec(move || apply_bash_isolation(&filter));
+            cmd.pre_exec(move || {
+                if let Some((rootfs_c, cwd_c)) = &chroot_data {
+                    apply_chroot(rootfs_c.as_ptr(), cwd_c.as_ptr())?;
+                }
+                if let Some(f) = &filter {
+                    apply_bash_isolation(f)?;
+                }
+                Ok(())
+            });
         }
     }
     let timeout = Duration::from_secs(req.timeout.clamp(1, 300));
@@ -777,8 +959,32 @@ fn make_state() -> anyhow::Result<Arc<AppState>> {
     } else {
         None
     };
+    // Choose session_root + (optionally) prepare a shared chroot rootfs.
+    // If chroot prep fails we degrade to no-chroot rather than refusing
+    // to start; the daemon log warns clearly.
+    let (session_root, chroot_root) = if isolation.chroot {
+        let rootfs = sandbox_root.join(".rootfs");
+        match prepare_shared_rootfs(&rootfs) {
+            Ok(()) => {
+                let sr = rootfs.join("sessions");
+                std::fs::create_dir_all(&sr)?;
+                (sr, Some(rootfs))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "chroot requested but prepare_shared_rootfs failed: {}; running without chroot",
+                    e
+                );
+                (sandbox_root.clone(), None)
+            }
+        }
+    } else {
+        (sandbox_root.clone(), None)
+    };
     Ok(Arc::new(AppState {
         sandbox_root,
+        session_root,
+        chroot_root,
         sessions: DashMap::new(),
         isolation,
         seccomp_filter,
@@ -819,6 +1025,8 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let state = Arc::new(AppState {
             sandbox_root: td.path().to_path_buf(),
+            session_root: td.path().to_path_buf(),
+            chroot_root: None,
             sessions: DashMap::new(),
             isolation: IsolationCfg::default(),
             seccomp_filter: None,
@@ -995,6 +1203,18 @@ mod tests {
             "filter is suspiciously small: {} insns",
             f.len()
         );
+    }
+
+    #[test]
+    fn prepare_shared_rootfs_idempotent_and_creates_bash() {
+        let td = tempfile::tempdir().unwrap();
+        let rootfs = td.path().join("rootfs");
+        prepare_shared_rootfs(&rootfs).expect("rootfs prep should succeed");
+        if std::path::Path::new("/bin/bash").exists() {
+            assert!(rootfs.join("bin/bash").exists());
+        }
+        // Idempotent — second call early-returns Ok.
+        prepare_shared_rootfs(&rootfs).expect("rootfs prep should be idempotent");
     }
 
     async fn make_sid(state: &Arc<AppState>, name: &str) -> String {
