@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "api-rust",
     "e2b-shim",
-    "worker-rust",
     "template-builder",
     "tools-rust",
 ]
