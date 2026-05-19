@@ -1,0 +1,11 @@
+# tools-node-dev — debian-slim + Node.js 20 toolchain.
+# Use when an agent task wants `node -e '...'` / npx tools available.
+
+name = "tools-node-dev"
+kind = "tools"
+base_image = "node:20-slim"
+extra_apt = ["git"]
+# Pre-installed npm globals available without `npm install` inside the
+# sandbox bash subprocess.
+# (template-builder doesn't run npm install for kind=tools yet; this
+# field is documentation-only for now.)

@@ -60,26 +60,26 @@ jobs:
       - name: Pull mindbox image back as template builder
         run: docker pull ${{ steps.img.outputs.base }}:latest
 
-      - name: Build tools-default template image
-        run: |
-          set -e
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v ${{ github.workspace }}/templates:/opt/inspect-api/templates:ro \
-            --entrypoint /usr/local/bin/template-build \
-            ${{ steps.img.outputs.base }}:latest \
-            tools-default
-          # Sanity-check the image exists locally.
-          docker images inspect-tpl-tools-tools-default --format \
-            'built: {{.Repository}}:{{.Tag}} {{.Size}}'
-
-      - name: Tag & push tools-default template image
+      - name: Build & push all tools-* template images
         run: |
           set -e
           SHA=${GITHUB_SHA::7}
-          TPL=${{ steps.img.outputs.base }}/tpl-tools-default
-          docker tag inspect-tpl-tools-tools-default:latest "$TPL:latest"
-          docker tag inspect-tpl-tools-tools-default:latest "$TPL:$SHA"
-          docker push "$TPL:latest"
-          docker push "$TPL:$SHA"
-          echo "pushed $TPL:latest + :$SHA"
+          # Discover every templates/tools-*/template.toml and build it.
+          for dir in templates/tools-*; do
+            tpl=$(basename "$dir")
+            [ -f "$dir/template.toml" ] || continue
+            echo "=== build $tpl ==="
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v ${{ github.workspace }}/templates:/opt/inspect-api/templates:ro \
+              --entrypoint /usr/local/bin/template-build \
+              ${{ steps.img.outputs.base }}:latest \
+              "$tpl"
+            LOCAL=inspect-tpl-tools-${tpl}:latest
+            REMOTE=${{ steps.img.outputs.base }}/tpl-${tpl}
+            docker tag "$LOCAL" "$REMOTE:latest"
+            docker tag "$LOCAL" "$REMOTE:$SHA"
+            docker push "$REMOTE:latest"
+            docker push "$REMOTE:$SHA"
+            echo "pushed $REMOTE:latest + :$SHA"
+          done

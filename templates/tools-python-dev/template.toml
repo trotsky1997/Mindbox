@@ -1,0 +1,11 @@
+# tools-python-dev — debian-slim + Python 3.12 toolchain.
+# Use when an agent task wants `python3 -c '...'` / pip-installed packages
+# available inside the tools-rust bash subprocess.
+
+name = "tools-python-dev"
+kind = "tools"
+base_image = "python:3.12-slim"
+# Floor (bash/ripgrep/fd-find/coreutils/findutils/tini/ca-certs) is added
+# by template-builder automatically.
+extra_apt = ["git"]
+extra_pip = ["uv", "pytest", "rich"]
