@@ -1,8 +1,8 @@
 //! /v2 routes that dispatch to a tools-rust daemon picked by the
 //! PagedRegistry. The daemon URL is resolved per request by acquiring the
 //! template — so a tools template gets lazy-spawned the first time it's
-//! used, and the same hot/warm/cold tier + LRU machinery applies as for
-//! python-pool templates.
+//! used, with the same hot/warm/cold tier + LRU machinery as every tools
+//! template.
 //!
 //! Backwards compat: if PagedRegistry has no `tools-*` template configured
 //! but TOOLS_DAEMON_URL env is set, we fall back to direct forward to
@@ -63,13 +63,9 @@ impl ToolsForwardState {
                     if let Some(u) = rt.pick_daemon_url() {
                         return Ok(u.to_string());
                     }
-                    // python-pool template — /v2 routes can't serve it.
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        format!(
-                            "template '{}' is python-pool (kind != tools); use /exec_hot",
-                            template
-                        ),
+                        format!("template '{}' is not backed by a tools daemon", template),
                     ));
                 }
                 Err(e) => {

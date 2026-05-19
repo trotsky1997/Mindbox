@@ -1,6 +1,5 @@
 # tools-default — minimal 7-tool template.
-# kind="tools" tells template-builder to build a tools-rust daemon image
-# instead of a worker-rust Python fork-pool image.
+# kind="tools" tells template-builder to build a tools-rust daemon image.
 
 name = "tools-default"
 kind = "tools"

@@ -1,10 +1,7 @@
-//! Build a hot-template docker image from templates/<name>/template.toml.
+//! Build a tools template docker image from templates/<name>/template.toml.
 //!
-//! Replaces template-build.py. Same behavior:
-//!   - Reads template.toml
-//!   - Copies worker-rust binary + inspect_pb2.py into a temp build context
-//!   - Generates Dockerfile (or uses templates/<name>/Dockerfile if present)
-//!   - Shells out to `docker build`
+//! Reads template.toml, copies the tools-rust daemon into a temporary build
+//! context, generates a Dockerfile when needed, and shells out to `docker build`.
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -131,8 +128,7 @@ fn build_tools(root: &Path, tpl_dir: &Path, name: &str, cfg: &TemplateCfg) -> Re
     let dockerfile = if custom_df.exists() {
         fs::read_to_string(&custom_df).context("read custom Dockerfile")?
     } else {
-        // Raw string sidesteps the `\"` / `\n` escape soup that the
-        // worker-rust Dockerfile generator wrestles with.
+        // Raw string sidesteps the `\"` / `\n` escape soup in generated Dockerfiles.
         format!(
             r#"FROM {base}
 ENV DEBIAN_FRONTEND=noninteractive

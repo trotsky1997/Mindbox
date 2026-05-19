@@ -17,7 +17,7 @@ services:
       INSPECT_API_TEMPLATES_DIR: /opt/inspect-api/templates
       RUST_LOG: info
     ports:
-      - "8000:8000"   # api-rust HTTP (incl. /exec_hot)
+      - "8000:8000"   # api-rust HTTP (/v2 tools API)
       - "8001:8001"   # e2b-shim (E2B-compatible)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

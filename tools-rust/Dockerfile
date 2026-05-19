@@ -17,9 +17,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY tools-rust/ ./tools-rust/
 # Stub the other workspace members so cargo --workspace resolves but we
 # only actually compile tools-rust.
-RUN mkdir -p api-rust/src e2b-shim/src worker-rust/src template-builder/src \
-    && echo "fn main() {}" | tee api-rust/src/main.rs e2b-shim/src/main.rs worker-rust/src/main.rs template-builder/src/main.rs >/dev/null \
-    && for c in api-rust e2b-shim worker-rust template-builder; do \
+RUN mkdir -p api-rust/src e2b-shim/src template-builder/src \
+    && echo "fn main() {}" | tee api-rust/src/main.rs e2b-shim/src/main.rs template-builder/src/main.rs >/dev/null \
+    && for c in api-rust e2b-shim template-builder; do \
          printf '[package]\nname = "%s"\nversion = "0.0.0"\nedition = "2021"\n[[bin]]\nname = "%s"\npath = "src/main.rs"\n' "$c" "$c" > "$c/Cargo.toml"; \
        done
 RUN cargo build --release -p tools-rust

@@ -140,7 +140,7 @@ fn tools_not_implemented(op: &str) -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
         format!(
-            r#"{{"code":"not_implemented","message":"e2b filesystem.{} isn't bridged to the tools backend yet; use /v2/sessions/<id>/tools/{} directly (or commands.run with shell), or switch the sandbox to a python-pool template"}}"#,
+            r#"{{"code":"not_implemented","message":"e2b filesystem.{} isn't bridged to the tools backend yet; use /v2/sessions/<id>/tools/{} directly or commands.run with shell"}}"#,
             op, op
         ),
     )
@@ -1073,8 +1073,7 @@ async fn files_post(
 ) -> Response {
     // Tools backend: forward to tools-rust /write via api-rust /v2.
     // We accept either raw bytes or multipart/form-data (e2b SDK uses
-    // multipart); the body extraction below is shared with the python-pool
-    // path so handle both before checking backend.
+    // multipart); handle both forms before forwarding to tools-rust.
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())

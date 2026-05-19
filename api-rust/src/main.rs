@@ -42,9 +42,7 @@ fn socket_root() -> &'static std::path::Path {
 #[derive(Deserialize, Debug, Clone)]
 struct TemplateConfig {
     name: String,
-    /// "python-pool" (worker-rust fork-pool, legacy) or "tools" (tools-rust
-    /// daemon for the 7-tool dispatcher). Decides which start_*_container
-    /// helper acquire() calls during cold start.
+    /// Template backend kind. Only "tools" is supported in the tools-only runtime.
     #[serde(default = "default_kind")]
     kind: String,
     #[serde(default = "default_base_image")]
@@ -67,10 +65,10 @@ struct TemplateConfig {
     engine: String,
 }
 fn default_kind() -> String {
-    "python-pool".into()
+    "tools".into()
 }
 fn default_base_image() -> String {
-    "python:3.12-slim".into()
+    "debian:bookworm-slim".into()
 }
 fn default_containers() -> usize {
     1
@@ -87,9 +85,7 @@ fn default_engine() -> String {
 
 // ---- runtime state ------------------------------------------------------
 
-/// What a TemplateRuntime is actually backed by. python-pool uses unix
-/// socket + child fd pool (worker-rust); tools uses a list of HTTP daemon
-/// URLs (tools-rust).
+/// Running tools-rust daemon containers for one template.
 struct TemplateRuntime {
     #[allow(dead_code)]
     container_ids: Vec<String>,
