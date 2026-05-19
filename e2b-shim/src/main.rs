@@ -102,6 +102,74 @@ fn is_tools_template(template_id: &str) -> bool {
     template_id == "tools" || template_id.starts_with("tools-")
 }
 
+/// Forward a single tool call to the tools-rust daemon via api-rust's /v2
+/// route. Used by file routes (read/write) when the sandbox's backend is
+/// "tools" — list/stat/mkdir/move route the same way but the daemon
+/// doesn't expose equivalents yet (502 returned at the call sites).
+async fn forward_tools_tool(
+    state: &AppState,
+    sid: &str,
+    tool: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let url = format!("{}/v2/sessions/{}/tools/{}", state.upstream, sid, tool);
+    let resp = state
+        .http
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("forward tools/{}: {}", tool, e),
+            )
+        })?;
+    let status = resp.status();
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("forward json: {}", e)))?;
+    if !status.is_success() {
+        return Err((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            v.to_string(),
+        ));
+    }
+    Ok(v)
+}
+
+/// Look up a sandbox's backend ("python-pool" or "tools"), or default.
+fn sandbox_backend(state: &AppState, sid: &str) -> String {
+    state
+        .sandboxes
+        .get(sid)
+        .map(|r| r.backend.clone())
+        .unwrap_or_else(default_backend)
+}
+
+/// Strip leading slash and ".." segments so the tools daemon's path
+/// resolver accepts the path. (Tools daemon enforces this server-side
+/// but we get a clearer 502 boundary by trimming here too.)
+fn tools_relative_path(p: &str) -> String {
+    p.trim_start_matches('/').to_string()
+}
+
+/// 501 response shape that e2b SDK consumers (or curl) can read as a
+/// hint to use the api-rust /v2 routes for tools-backend file ops that
+/// don't have a 1:1 e2b mapping yet (list/stat/mkdir/move).
+fn tools_not_implemented(op: &str) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        format!(
+            r#"{{"code":"not_implemented","message":"e2b filesystem.{} isn't bridged to the tools backend yet; use /v2/sessions/<id>/tools/{} directly (or commands.run with shell), or switch the sandbox to a python-pool template"}}"#,
+            op, op
+        ),
+    )
+        .into_response()
+}
+
 const SANDBOX_FS_ROOT: &str = "/var/lib/e2b-shim/sandboxes";
 const SANDBOX_REGISTRY_DIR: &str = "/var/lib/e2b-shim/registry";
 
@@ -1258,6 +1326,11 @@ fn unary_json_response(ct: &str, value: serde_json::Value) -> Response {
 }
 
 async fn fs_stat(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Ok(sid) = pick_sandbox_id(&state, &headers) {
+        if sandbox_backend(&state, &sid) == "tools" {
+            return tools_not_implemented("stat");
+        }
+    }
     let ct = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -1293,6 +1366,11 @@ async fn fs_stat(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
 }
 
 async fn fs_mkdir(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Ok(sid) = pick_sandbox_id(&state, &headers) {
+        if sandbox_backend(&state, &sid) == "tools" {
+            return tools_not_implemented("mkdir");
+        }
+    }
     let ct = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -1317,6 +1395,11 @@ async fn fs_mkdir(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
 }
 
 async fn fs_list(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Ok(sid) = pick_sandbox_id(&state, &headers) {
+        if sandbox_backend(&state, &sid) == "tools" {
+            return tools_not_implemented("list");
+        }
+    }
     let ct = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -1369,6 +1452,11 @@ async fn fs_remove(
 }
 
 async fn fs_move(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Ok(sid) = pick_sandbox_id(&state, &headers) {
+        if sandbox_backend(&state, &sid) == "tools" {
+            return tools_not_implemented("move");
+        }
+    }
     let ct = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -1415,6 +1503,31 @@ async fn files_get(
     headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<FilesQuery>,
 ) -> Response {
+    // Tools backend: forward to tools-rust /read via api-rust /v2.
+    if let Ok(sid) = pick_sandbox_id(&state, &headers) {
+        if sandbox_backend(&state, &sid) == "tools" {
+            let rel = tools_relative_path(&q.path);
+            return match forward_tools_tool(
+                &state,
+                &sid,
+                "read",
+                serde_json::json!({ "path": rel }),
+            )
+            .await
+            {
+                Ok(v) => {
+                    let content = v.get("content").and_then(|s| s.as_str()).unwrap_or("");
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/octet-stream")],
+                        content.as_bytes().to_vec(),
+                    )
+                        .into_response()
+                }
+                Err((s, m)) => (s, m).into_response(),
+            };
+        }
+    }
     let path = match resolve_path(&state, &headers, &q.path) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -1436,20 +1549,15 @@ async fn files_post(
     axum::extract::Query(q): axum::extract::Query<FilesQuery>,
     body: Bytes,
 ) -> Response {
-    let path = match resolve_path(&state, &headers, &q.path) {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // E2B uploads use multipart/form-data; for now we accept raw bytes too.
+    // Tools backend: forward to tools-rust /write via api-rust /v2.
+    // We accept either raw bytes or multipart/form-data (e2b SDK uses
+    // multipart); the body extraction below is shared with the python-pool
+    // path so handle both before checking backend.
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let payload: Vec<u8> = if content_type.contains("multipart/form-data") {
-        // Extract first file part: naive boundary scanner.
+    let payload_for_tools: Vec<u8> = if content_type.contains("multipart/form-data") {
         match extract_first_multipart_file(content_type, &body) {
             Some(p) => p,
             None => return (StatusCode::BAD_REQUEST, "empty multipart").into_response(),
@@ -1457,6 +1565,48 @@ async fn files_post(
     } else {
         body.to_vec()
     };
+    if let Ok(sid) = pick_sandbox_id(&state, &headers) {
+        if sandbox_backend(&state, &sid) == "tools" {
+            let content = match String::from_utf8(payload_for_tools.clone()) {
+                Ok(s) => s,
+                Err(_) => {
+                    return (
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        r#"{"code":"unsupported","message":"tools backend file write requires UTF-8 content; binary file write isn't bridged through e2b API — use /v2/sessions/<id>/tools/write directly"}"#,
+                    )
+                        .into_response();
+                }
+            };
+            let rel = tools_relative_path(&q.path);
+            return match forward_tools_tool(
+                &state,
+                &sid,
+                "write",
+                serde_json::json!({ "path": rel, "content": content }),
+            )
+            .await
+            {
+                Ok(_) => {
+                    let resp = serde_json::json!([{
+                        "name": rel.rsplit('/').next().unwrap_or(""),
+                        "type": "file",
+                        "path": format!("/{}", rel),
+                    }]);
+                    (StatusCode::OK, Json(resp)).into_response()
+                }
+                Err((s, m)) => (s, m).into_response(),
+            };
+        }
+    }
+    let path = match resolve_path(&state, &headers, &q.path) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Body already extracted above (shared with tools backend path).
+    let payload = payload_for_tools;
     match std::fs::write(&path, &payload) {
         Ok(_) => {
             let name = path
