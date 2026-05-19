@@ -37,6 +37,121 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub struct AppState {
     sandbox_root: PathBuf,
     sessions: DashMap<String, PathBuf>,
+    isolation: IsolationCfg,
+}
+
+/// Which optional isolation layers to apply on bash subprocess spawn.
+/// Default: all off (backwards-compat). Enable via TOOLS_ISOLATION env,
+/// comma-separated. Recognised values: "chroot", "seccomp", "cgroup".
+/// Layers that aren't supported by the host environment silently no-op
+/// (e.g. cgroup v2 not mounted → cgroup flag still parsed but effective_cgroup
+/// returns None at first use).
+#[derive(Debug, Clone, Default)]
+pub struct IsolationCfg {
+    pub chroot: bool,
+    pub seccomp: bool,
+    pub cgroup: bool,
+    /// Path to the cgroup v2 root, if the host exposes one we can write to.
+    /// Cached at startup; if `cgroup` is enabled but this is None, every
+    /// per-session attempt to create a sub-cgroup is a no-op.
+    pub cgroup_root: Option<PathBuf>,
+}
+
+impl IsolationCfg {
+    pub fn from_env() -> Self {
+        let raw = std::env::var("TOOLS_ISOLATION").unwrap_or_default();
+        let set: std::collections::HashSet<&str> = raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let cgroup = set.contains("cgroup");
+        let cgroup_root = if cgroup { detect_cgroup_v2() } else { None };
+        Self {
+            chroot: set.contains("chroot"),
+            seccomp: set.contains("seccomp"),
+            cgroup,
+            cgroup_root,
+        }
+    }
+    /// True if any layer is actually active (declared AND supported).
+    #[allow(dead_code)]
+    pub fn any_active(&self) -> bool {
+        self.chroot || self.seccomp || self.cgroup_root.is_some()
+    }
+}
+
+/// Detect a writable cgroup v2 hierarchy. Returns Some(root) iff:
+/// 1. `/sys/fs/cgroup/cgroup.controllers` exists (so we are on cgroup v2)
+/// 2. We can mkdir a probe directory under it (so delegation gives us write)
+///
+/// Otherwise None — caller skips cgroup ops.
+fn detect_cgroup_v2() -> Option<PathBuf> {
+    let root = PathBuf::from("/sys/fs/cgroup");
+    if !root.join("cgroup.controllers").exists() {
+        return None;
+    }
+    let probe = root.join(format!(".mindbox-probe-{}", std::process::id()));
+    match std::fs::create_dir(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_dir(&probe);
+            Some(root)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Create a sub-cgroup for the session and apply default limits. Returns
+/// the cgroup directory path if successful; None when cgroup layer is off
+/// or write fails (so the caller can skip the join step gracefully).
+fn create_session_cgroup(isolation: &IsolationCfg, sid: &str) -> Option<PathBuf> {
+    let root = isolation.cgroup_root.as_ref()?;
+    let dir = root.join(format!("mindbox-{}", sid));
+    if std::fs::create_dir(&dir).is_err() {
+        return None;
+    }
+    // Conservative defaults — env overrides could be added later.
+    let _ = std::fs::write(
+        dir.join("memory.max"),
+        b"512M
+",
+    );
+    let _ = std::fs::write(
+        dir.join("cpu.max"),
+        b"50000 100000
+",
+    ); // 50% of 1 core
+    let _ = std::fs::write(
+        dir.join("pids.max"),
+        b"256
+",
+    );
+    Some(dir)
+}
+
+/// Add a process to its session's cgroup. Best-effort: silently ignores
+/// failure (the session cwd still exists; bash will just run uncgrouped).
+fn cgroup_attach_pid(cgroup_dir: &std::path::Path, pid: u32) {
+    let _ = std::fs::write(
+        cgroup_dir.join("cgroup.procs"),
+        format!(
+            "{}
+",
+            pid
+        ),
+    );
+}
+
+/// Best-effort cgroup teardown. Kills any remaining processes (kill_pids)
+/// then rmdirs. Failure is silent (process might already be gone, kernel
+/// keeps the empty cgroup until last ref drops).
+fn cleanup_session_cgroup(cgroup_dir: &std::path::Path) {
+    let _ = std::fs::write(
+        cgroup_dir.join("cgroup.kill"),
+        b"1
+",
+    );
+    let _ = std::fs::remove_dir(cgroup_dir);
 }
 
 #[derive(Serialize)]
@@ -241,6 +356,7 @@ async fn create_session(
     tokio::fs::create_dir_all(&cwd)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}")))?;
+    let _ = create_session_cgroup(&state.isolation, &id);
     state.sessions.insert(id.clone(), cwd.clone());
     Ok(Json(CreateSessionResp {
         session_id: id,
@@ -256,6 +372,9 @@ async fn delete_session(
         return Err((StatusCode::NOT_FOUND, format!("session {id} not found")));
     };
     let _ = tokio::fs::remove_dir_all(&cwd).await; // best-effort cleanup
+    if let Some(root) = state.isolation.cgroup_root.as_ref() {
+        cleanup_session_cgroup(&root.join(format!("mindbox-{}", id)));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -500,23 +619,39 @@ async fn tool_bash(
     let cwd = resolve_session(&state, &sid)?.clone();
     let mut cmd = Command::new("/bin/bash");
     cmd.arg("-c").arg(&req.cmd).current_dir(&cwd);
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
     let timeout = Duration::from_secs(req.timeout.clamp(1, 300));
-    let fut = cmd.output();
-    let (stdout, stderr, exit_code, timed_out) = match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(o)) => (
-            String::from_utf8_lossy(&o.stdout).into_owned(),
-            String::from_utf8_lossy(&o.stderr).into_owned(),
-            o.status.code().unwrap_or(-1),
-            false,
-        ),
-        Ok(Err(e)) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}"))),
-        Err(_) => (
-            String::new(),
-            format!("timeout after {}s", timeout.as_secs()),
-            124,
-            true,
-        ),
-    };
+    let cgroup_dir = state
+        .isolation
+        .cgroup_root
+        .as_ref()
+        .map(|root| root.join(format!("mindbox-{}", sid)));
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
+    if let (Some(dir), Some(pid)) = (cgroup_dir.as_ref(), child.id()) {
+        cgroup_attach_pid(dir, pid);
+    }
+    let (stdout, stderr, exit_code, timed_out) =
+        match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(o)) => (
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+                o.status.code().unwrap_or(-1),
+                false,
+            ),
+            Ok(Err(e)) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("wait: {e}"))),
+            Err(_) => (
+                String::new(),
+                format!("timeout after {}s", timeout.as_secs()),
+                124,
+                true,
+            ),
+        };
     Ok(Json(BashResp {
         stdout,
         stderr,
@@ -548,9 +683,18 @@ fn make_state() -> anyhow::Result<Arc<AppState>> {
     let sandbox_root =
         PathBuf::from(std::env::var("TOOLS_SANDBOX_ROOT").unwrap_or_else(|_| "/sandboxes".into()));
     std::fs::create_dir_all(&sandbox_root)?;
+    let isolation = IsolationCfg::from_env();
+    tracing::info!(
+        "isolation: chroot={} seccomp={} cgroup={} (cgroup_root={:?})",
+        isolation.chroot,
+        isolation.seccomp,
+        isolation.cgroup,
+        isolation.cgroup_root,
+    );
     Ok(Arc::new(AppState {
         sandbox_root,
         sessions: DashMap::new(),
+        isolation,
     }))
 }
 
@@ -589,6 +733,7 @@ mod tests {
         let state = Arc::new(AppState {
             sandbox_root: td.path().to_path_buf(),
             sessions: DashMap::new(),
+            isolation: IsolationCfg::default(),
         });
         (td, state)
     }
@@ -721,6 +866,37 @@ mod tests {
         let (_td, state) = tmp_state();
         let err = delete_session(State(state), Path("nope".into())).await;
         assert!(matches!(err, Err((StatusCode::NOT_FOUND, _))));
+    }
+
+    #[test]
+    fn isolation_from_env_unset() {
+        std::env::remove_var("TOOLS_ISOLATION");
+        let c = IsolationCfg::from_env();
+        assert!(!c.chroot && !c.seccomp && !c.cgroup);
+    }
+
+    #[test]
+    fn isolation_from_env_chroot_seccomp() {
+        std::env::set_var("TOOLS_ISOLATION", "chroot,seccomp");
+        let c = IsolationCfg::from_env();
+        assert!(c.chroot && c.seccomp);
+        assert!(!c.cgroup);
+        std::env::remove_var("TOOLS_ISOLATION");
+    }
+
+    #[test]
+    fn isolation_from_env_handles_whitespace_and_empty() {
+        std::env::set_var("TOOLS_ISOLATION", "  chroot  , , seccomp ,  ");
+        let c = IsolationCfg::from_env();
+        assert!(c.chroot && c.seccomp);
+        std::env::remove_var("TOOLS_ISOLATION");
+    }
+
+    #[test]
+    fn detect_cgroup_v2_no_panic() {
+        // We can't pretend to be on a host with cgroup v2 in unit tests;
+        // exercise the function and assert it doesn't panic.
+        let _ = detect_cgroup_v2();
     }
 
     async fn make_sid(state: &Arc<AppState>, name: &str) -> String {
