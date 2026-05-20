@@ -33,10 +33,7 @@ COPY api-rust/ ./api-rust/
 COPY e2b-shim/ ./e2b-shim/
 COPY template-builder/ ./template-builder/
 COPY tools-rust/ ./tools-rust/
-RUN cd api-rust && cargo build --release
-RUN cd e2b-shim && cargo build --release
-RUN cd template-builder && cargo build --release
-RUN cd tools-rust && cargo build --release
+RUN cargo build --release --workspace --bins
 
 FROM debian:bookworm-slim
 ARG COMPOSE_VERSION=v2.32.4
@@ -47,10 +44,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose \
        https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64 \
     && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-COPY --from=build /src/api-rust/target/release/api-rust /usr/local/bin/api-rust
-COPY --from=build /src/e2b-shim/target/release/e2b-shim /usr/local/bin/e2b-shim
-COPY --from=build /src/template-builder/target/release/template-build /usr/local/bin/template-build
-COPY --from=build /src/tools-rust/target/release/tools-rust /opt/inspect-api/tools-rust/target/release/tools-rust
+COPY --from=build /src/target/release/api-rust /usr/local/bin/api-rust
+COPY --from=build /src/target/release/e2b-shim /usr/local/bin/e2b-shim
+COPY --from=build /src/target/release/template-build /usr/local/bin/template-build
+COPY --from=build /src/target/release/tools-rust /opt/inspect-api/tools-rust/target/release/tools-rust
 RUN mkdir -p /var/lib/e2b-shim/registry /var/lib/e2b-shim/sandboxes /opt/inspect-api/templates
 COPY <<'ENTRY' /usr/local/bin/mindbox-entrypoint
 #!/bin/bash
