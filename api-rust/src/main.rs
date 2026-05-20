@@ -663,11 +663,91 @@ async fn run_template_warmup(daemon_url: &str, cfg: &TemplateConfig, idx: usize)
     Ok(())
 }
 
+/// Name of the user-defined docker network mindbox attaches both itself and
+/// every spawned tools template container to. Override with
+/// MINDBOX_TOOLS_NETWORK; default is "mindbox-tools".
+fn tools_network_name() -> String {
+    std::env::var("MINDBOX_TOOLS_NETWORK").unwrap_or_else(|_| "mindbox-tools".into())
+}
+
+/// Ensure a bridge-driver, attachable docker network with `tools_network_name()`
+/// exists. Returns Ok(()) whether the network was just created or already
+/// existed. This is the rendezvous point spawned tools containers and the
+/// running mindbox container share, so api-rust can reach them by container
+/// IP without depending on host loopback (which is invisible to api-rust when
+/// it is itself running inside a container behind a path-rewriting docker
+/// proxy, e.g. on dev-containers).
+pub async fn ensure_tools_network(docker: &Docker) -> Result<String> {
+    let name = tools_network_name();
+    match docker.inspect_network::<String>(&name, None).await {
+        Ok(_) => return Ok(name),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut labels = HashMap::new();
+    labels.insert("inspect-api-net".to_string(), "1".to_string());
+    let create = bollard::network::CreateNetworkOptions {
+        name: name.clone(),
+        driver: "bridge".to_string(),
+        check_duplicate: true,
+        attachable: true,
+        labels,
+        ..Default::default()
+    };
+    match docker.create_network(create).await {
+        Ok(_) => Ok(name),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409, ..
+        }) => Ok(name),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Best-effort connect the current mindbox container (identified by its own
+/// hostname inside the container, which docker sets to the container ID) to
+/// the tools network so api-rust can reach spawned tools containers by their
+/// network IP. Silently no-ops if we are not running inside a docker
+/// container (hostname is not a container id) or if docker rejects the
+/// connect (e.g. already connected).
+pub async fn self_attach_to_tools_network(docker: &Docker, network: &str) {
+    let Ok(hostname) = std::env::var("HOSTNAME") else {
+        return;
+    };
+    if hostname.is_empty() {
+        return;
+    }
+    let connect = bollard::network::ConnectNetworkOptions {
+        container: hostname.clone(),
+        endpoint_config: bollard::models::EndpointSettings::default(),
+    };
+    match docker.connect_network(network, connect).await {
+        Ok(_) => eprintln!("[paged] self-attached {} to {}", hostname, network),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message,
+            ..
+        }) if status_code == 403 || status_code == 404 || status_code == 409 => {
+            // 403 = not inside docker / cannot self-attach.
+            // 404 = hostname is not a container id (running bare metal).
+            // 409 = already attached.
+            if status_code != 409 {
+                eprintln!(
+                    "[paged] self-attach {} → {} skipped (HTTP {}): {}",
+                    hostname, network, status_code, message
+                );
+            }
+        }
+        Err(e) => eprintln!("[paged] WARN self-attach to {} failed: {}", network, e),
+    }
+}
+
 /// Spawn a tools-rust daemon container for the given template. The image
 /// must be tagged `inspect-tpl-tools-<cfg.name>:latest` (template-builder
-/// `kind="tools"` adds the "tools-" prefix). The container exposes 8002 to
-/// a random host port; we read that back via docker inspect and return it
-/// as the daemon URL the api-rust /v2 forward should hit.
+/// `kind="tools"` adds the "tools-" prefix). The container joins the shared
+/// `mindbox-tools` network so api-rust can reach it by container IP on port
+/// 8002 — we never publish 8002 on the host.
 async fn start_tools_container(
     docker: &Docker,
     cfg: &TemplateConfig,
@@ -683,6 +763,7 @@ async fn start_tools_container(
         ));
     }
 
+    let network = ensure_tools_network(docker).await?;
     let mem = parse_memory(&cfg.memory_reservation)?;
 
     let mut labels = HashMap::new();
@@ -690,39 +771,35 @@ async fn start_tools_container(
     labels.insert("inspect-tpl".to_string(), cfg.name.clone());
     labels.insert("inspect-kind".to_string(), "tools".to_string());
 
-    // Map container :8002 → random host port. host_ip="127.0.0.1" keeps the
-    // port loopback-only (this is api-rust → daemon on the same host).
-    let mut port_bindings: HashMap<String, Option<Vec<bollard::models::PortBinding>>> =
-        HashMap::new();
-    port_bindings.insert(
-        "8002/tcp".to_string(),
-        Some(vec![bollard::models::PortBinding {
-            host_ip: Some("127.0.0.1".into()),
-            host_port: Some("".into()), // empty → docker picks a free port
-        }]),
-    );
-
     let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
     exposed_ports.insert("8002/tcp".to_string(), HashMap::new());
+
+    let mut endpoints: HashMap<String, bollard::models::EndpointSettings> = HashMap::new();
+    endpoints.insert(
+        network.clone(),
+        bollard::models::EndpointSettings::default(),
+    );
 
     let config = bollard::container::Config::<String> {
         image: Some(tag),
         labels: Some(labels),
         exposed_ports: Some(exposed_ports),
         host_config: Some(HostConfig {
-            port_bindings: Some(port_bindings),
             memory_reservation: Some(mem),
             cpu_shares: Some(1024),
             pids_limit: Some(cfg.pids_limit),
             oom_score_adj: Some(500),
             security_opt: Some(vec!["no-new-privileges".into()]),
-            // tools container needs network for /v2 forward over loopback;
-            // user code inside (via tools/bash) shouldn't see external
-            // network. Bridge default — operators can override.
-            network_mode: Some(
-                std::env::var("TOOLS_CONTAINER_NETWORK_MODE").unwrap_or_else(|_| "bridge".into()),
-            ),
+            // Default to the shared tools network. Operators can still force
+            // a different mode (e.g. "host" for a single-host setup, or
+            // "none" for an extra-isolated container without network), but
+            // then they lose api-rust reachability and must wire it up
+            // themselves.
+            network_mode: std::env::var("TOOLS_CONTAINER_NETWORK_MODE").ok(),
             ..Default::default()
+        }),
+        networking_config: Some(bollard::container::NetworkingConfig {
+            endpoints_config: endpoints,
         }),
         ..Default::default()
     };
@@ -754,7 +831,6 @@ async fn start_tools_container(
         return Err(e).context("start tools container");
     }
 
-    // Inspect to learn the assigned host port.
     let inspected = match docker.inspect_container(&created.id, None).await {
         Ok(inspected) => inspected,
         Err(e) => {
@@ -762,18 +838,18 @@ async fn start_tools_container(
             return Err(e).context("inspect tools container");
         }
     };
-    let Some(host_port) = inspected
+    let Some(ip) = inspected
         .network_settings
         .as_ref()
-        .and_then(|ns| ns.ports.as_ref())
-        .and_then(|p| p.get("8002/tcp").cloned().flatten())
-        .and_then(|v| v.into_iter().next())
-        .and_then(|pb| pb.host_port)
+        .and_then(|ns| ns.networks.as_ref())
+        .and_then(|nets| nets.get(&network))
+        .and_then(|ep| ep.ip_address.clone())
+        .filter(|s| !s.is_empty())
     else {
         remove_container_best_effort(docker, &created.id).await;
-        return Err(anyhow!("tools container has no published 8002/tcp port"));
+        return Err(anyhow!("tools container has no IP on network {}", network));
     };
-    let daemon_url = format!("http://127.0.0.1:{}", host_port);
+    let daemon_url = format!("http://{}:8002", ip);
 
     // Wait for /health to return 200.
     let client = reqwest::Client::builder()
@@ -916,6 +992,19 @@ async fn main() -> Result<()> {
         hot_limit,
         warm_limit
     );
+
+    // Set up the shared tools network and best-effort attach this mindbox
+    // container to it, so api-rust can reach spawned tools containers by their
+    // network IP instead of host loopback (which is invisible from inside a
+    // container, especially behind dev-container docker proxies).
+    match ensure_tools_network(&docker).await {
+        Ok(net) => {
+            eprintln!("[api] tools network ready: {}", net);
+            self_attach_to_tools_network(&docker, &net).await;
+        }
+        Err(e) => eprintln!("[api] WARN ensure_tools_network failed: {}", e),
+    }
+
     let registry = Arc::new(PagedRegistry::new(docker, cfg_map, hot_limit, warm_limit));
 
     let state = Arc::new(AppState { registry });
@@ -1050,6 +1139,19 @@ mod tests {
     #[test]
     fn truncate_warmup_output_keeps_short_text() {
         assert_eq!(truncate_warmup_output("short"), "short");
+    }
+
+    #[test]
+    fn tools_network_name_defaults_and_overrides() {
+        let prev = std::env::var("MINDBOX_TOOLS_NETWORK").ok();
+        std::env::remove_var("MINDBOX_TOOLS_NETWORK");
+        assert_eq!(tools_network_name(), "mindbox-tools");
+        std::env::set_var("MINDBOX_TOOLS_NETWORK", "my-net");
+        assert_eq!(tools_network_name(), "my-net");
+        match prev {
+            Some(v) => std::env::set_var("MINDBOX_TOOLS_NETWORK", v),
+            None => std::env::remove_var("MINDBOX_TOOLS_NETWORK"),
+        }
     }
 
     // ---- send_frame / recv_frame ---------------------------------------

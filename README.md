@@ -112,6 +112,16 @@ Override `MINDBOX_TEMPLATE_REGISTRY` to point at a private registry, or set
 socket. Mount a custom `templates/` directory at
 `/opt/inspect-api/templates` to override the bundled defaults.
 
+### Tools network
+
+mindbox spawned tools containers join a shared user-defined docker network
+(default name `mindbox-tools`, overridable via `MINDBOX_TOOLS_NETWORK`) and
+api-rust talks to them by container IP on port 8002. mindbox best-effort
+self-attaches to that network at startup, so the same single `docker run`
+works both on a normal host and inside a dev-container where the host
+loopback is invisible from the mindbox container. No `-p 8002` publishing is
+needed for the tools containers.
+
 ## Tool API
 
 All seven tools share the same shape — `POST /v2/sessions/:sid/tools/:name`
