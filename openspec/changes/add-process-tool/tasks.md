@@ -1,31 +1,31 @@
 ## 1. Scaffolding and config
 
-- [ ] 1.1 Add new env knobs (`TOOLS_PROCESS_ENABLED`, `TOOLS_EXPOSE_PROCESS`, `TOOLS_MAX_PROCESSES_PER_SESSION` default 32, `TOOLS_PROCESS_BUFFER_BYTES` default 262144, `TOOLS_SESSION_IDLE_REAP_SEC` default 3600, `TOOLS_PROCESS_KILL_GROUP` default 1) to a single `ProcessCfg::from_env()` helper in `tools-rust/src/main.rs`
+- [x] 1.1 Add new env knobs (`TOOLS_PROCESS_ENABLED`, `TOOLS_EXPOSE_PROCESS`, `TOOLS_MAX_PROCESSES_PER_SESSION` default 32, `TOOLS_PROCESS_BUFFER_BYTES` default 262144, `TOOLS_SESSION_IDLE_REAP_SEC` default 3600, `TOOLS_PROCESS_KILL_GROUP` default 1) to a single `ProcessCfg::from_env()` helper in `tools-rust/src/main.rs`
 - [ ] 1.2 Document the knobs in `README.md` and `.env.example` (default values, "trusted only" wording, "session-scoped lifetime" wording)
 - [x] 1.3 Extract `tool_bash`'s sandbox `Command` build into a private helper `build_sandboxed_command(state, sid, cmd, args, env, cwd_override)`; rewrite `tool_bash` to call it (refactor with no behavior change)
 
 ## 2. Schema and HTTP plumbing
 
-- [ ] 2.1 Add `ProcessReq`, `ProcessAction` (enum with snake_case), `ProcessEncoding`, `ProcessResult`, `ProcessSummary` types in `tools-rust/src/main.rs`
-- [ ] 2.2 Enforce per-action mandatory-field rules and reject mismatches with `400` (unit-tested via `serde_json::from_value` + handler entry)
-- [ ] 2.3 Add the `POST /sessions/:sid/tools/process` route; when `TOOLS_PROCESS_ENABLED` is unset return `404` ahead of any other parsing
+- [x] 2.1 Add `ProcessReq`, `ProcessAction` (enum with snake_case), `ProcessEncoding`, `ProcessResult`, `ProcessSummary` types in `tools-rust/src/main.rs`
+- [x] 2.2 Enforce per-action mandatory-field rules and reject mismatches with `400` (unit-tested via `serde_json::from_value` + handler entry)
+- [x] 2.3 Add the `POST /sessions/:sid/tools/process` route; when `TOOLS_PROCESS_ENABLED` is unset return `404` ahead of any other parsing
 - [ ] 2.4 Add `api-rust/src/tools_forward.rs` gate: when `TOOLS_EXPOSE_PROCESS` is unset, route returns `403 {"code":"process_forbidden", ...}` before contacting upstream
 
 ## 3. Session-embedded process registry
 
 - [x] 3.1 Upgrade `AppState.sessions` from `DashMap<String, PathBuf>` to `DashMap<String, Arc<SessionState>>`; `SessionState` holds `cwd`, `last_touched: AtomicInstant`, and `processes: DashMap<String, Arc<ProcessHandle>>`
-- [ ] 3.2 Add `ProcessHandle`, `ProcessState`, and a bounded `RingBuffer` (with read cursor and `truncated_total_bytes` counter)
-- [ ] 3.3 Enforce `TOOLS_MAX_PROCESSES_PER_SESSION` on `start`, returning `429` when the cap is hit; reject `process_id`s that do not belong to the calling session with `404`
+- [x] 3.2 Add `ProcessHandle`, `ProcessState`, and a bounded `RingBuffer` (with read cursor and `truncated_total_bytes` counter)
+- [x] 3.3 Enforce `TOOLS_MAX_PROCESSES_PER_SESSION` on `start`, returning `429` when the cap is hit; reject `process_id`s that do not belong to the calling session with `404`
 
 ## 4. Action handlers
 
-- [ ] 4.1 Implement `start`: spawn through `build_sandboxed_command`, set `setsid()` in `pre_exec`, attach the per-session cgroup, spin up stdout/stderr drain tasks and a wait task, populate the handle, return `{process_id, running:true}`
+- [x] 4.1 Implement `start`: spawn through `build_sandboxed_command`, set `setsid()` in `pre_exec`, attach the per-session cgroup, spin up stdout/stderr drain tasks and a wait task, populate the handle, return `{process_id, running:true}`
 - [ ] 4.2 Implement `write`: lock stdin, write `input` (utf-8 or base64), honor `eof:true` by dropping the stdin handle; tolerate already-exited child by returning `{running:false, exit_code}`
-- [ ] 4.3 Implement `read`: pop from stdout+stderr ring buffers, advance cursors, honor `max_bytes`, populate `eof_*` after wait task closes the writer side, support short-blocking via `tokio::time::timeout(notify.notified(), min(timeout_sec, 60s))`
+- [x] 4.3 Implement `read`: pop from stdout+stderr ring buffers, advance cursors, honor `max_bytes`, populate `eof_*` after wait task closes the writer side, support short-blocking via `tokio::time::timeout(notify.notified(), min(timeout_sec, 60s))`
 - [ ] 4.4 Implement `signal`: parse name → `libc::c_int`, send via `kill(-pgid, sig)` when `TOOLS_PROCESS_KILL_GROUP=1` else `kill(pid, sig)`, treat ESRCH on exited child as success
-- [ ] 4.5 Implement `wait`: park on `wait_notify` until terminal state or `timeout_sec` (default 300s), return appropriate fields; non-zero exit code stays a successful response
+- [x] 4.5 Implement `wait`: park on `wait_notify` until terminal state or `timeout_sec` (default 300s), return appropriate fields; non-zero exit code stays a successful response
 - [ ] 4.6 Implement `stop`: send graceful signal (`SIGTERM`), wait for grace, escalate to `SIGKILL`, return final state; respect kill-group setting
-- [ ] 4.7 Implement `list`: snapshot the session's process map, return `ProcessSummary[]` (id, command, started_at, running, exit_code if any)
+- [x] 4.7 Implement `list`: snapshot the session's process map, return `ProcessSummary[]` (id, command, started_at, running, exit_code if any)
 
 ## 5. Lifecycle integration
 

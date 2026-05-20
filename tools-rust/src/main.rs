@@ -29,6 +29,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use uuid::Uuid;
 
+mod process;
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -49,16 +51,18 @@ pub struct AppState {
     sessions: DashMap<String, Arc<SessionState>>,
     isolation: IsolationCfg,
     seccomp_filter: Option<Arc<seccompiler::BpfProgram>>,
+    pub process_cfg: process::ProcessCfg,
 }
 
 /// Per-session daemon-side state. A session is the lifetime anchor for
 /// everything spawned during one agent task: its sandbox cwd, its last
-/// touched timestamp (future: idle reaper), and (future: process tool)
-/// its set of long-lived child processes. Dropping the `Arc<SessionState>`
+/// touched timestamp (idle reaper), and its set of long-lived child
+/// processes (eighth `process` tool). Dropping the `Arc<SessionState>`
 /// is what frees session-owned resources.
 pub struct SessionState {
     pub cwd: PathBuf,
     pub last_touched: std::sync::Mutex<std::time::Instant>,
+    pub processes: process::SessionProcessMap,
 }
 
 impl SessionState {
@@ -66,11 +70,11 @@ impl SessionState {
         Self {
             cwd,
             last_touched: std::sync::Mutex::new(std::time::Instant::now()),
+            processes: DashMap::new(),
         }
     }
 
-    #[allow(dead_code)]
-    fn touch(&self) {
+    pub fn touch(&self) {
         *self.last_touched.lock().unwrap() = std::time::Instant::now();
     }
 }
@@ -166,7 +170,7 @@ fn create_session_cgroup(isolation: &IsolationCfg, sid: &str) -> Option<PathBuf>
 
 /// Add a process to its session's cgroup. Best-effort: silently ignores
 /// failure (the session cwd still exists; bash will just run uncgrouped).
-fn cgroup_attach_pid(cgroup_dir: &std::path::Path, pid: u32) {
+pub(crate) fn cgroup_attach_pid(cgroup_dir: &std::path::Path, pid: u32) {
     let _ = std::fs::write(
         cgroup_dir.join("cgroup.procs"),
         format!(
@@ -581,7 +585,7 @@ struct FindResp {
 
 /// Resolve `rel` against `cwd`, refusing anything that escapes `cwd`.
 /// Absolute paths and `..` segments are rejected.
-fn resolve_in(cwd: &StdPath, rel: &str) -> Result<PathBuf, (StatusCode, String)> {
+pub(crate) fn resolve_in(cwd: &StdPath, rel: &str) -> Result<PathBuf, (StatusCode, String)> {
     if rel.starts_with('/') {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -607,7 +611,7 @@ fn resolve_in(cwd: &StdPath, rel: &str) -> Result<PathBuf, (StatusCode, String)>
     Ok(normalized)
 }
 
-fn resolve_session<'a>(
+pub(crate) fn resolve_session<'a>(
     state: &'a AppState,
     sid: &str,
 ) -> Result<dashmap::mapref::one::Ref<'a, String, Arc<SessionState>>, (StatusCode, String)> {
@@ -1146,7 +1150,7 @@ async fn tool_find(
 /// child) and the eighth `process` tool (long-lived child). Spawn,
 /// timeout, and cgroup-attach happen in the caller because they differ
 /// between one-shot and long-lived semantics.
-fn build_sandboxed_command(
+pub(crate) fn build_sandboxed_command(
     state: &AppState,
     sid: &str,
     session_cwd: &StdPath,
@@ -1261,6 +1265,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/tools/grep", post(tool_grep))
         .route("/sessions/:id/tools/find", post(tool_find))
         .route("/sessions/:id/tools/bash", post(tool_bash))
+        .route("/sessions/:id/tools/process", post(process::tool_process))
         .with_state(state)
 }
 
@@ -1319,6 +1324,7 @@ fn make_state() -> anyhow::Result<Arc<AppState>> {
         sessions: DashMap::new(),
         isolation,
         seccomp_filter,
+        process_cfg: process::ProcessCfg::from_env(),
     }))
 }
 
@@ -1361,6 +1367,14 @@ mod tests {
             sessions: DashMap::new(),
             isolation: IsolationCfg::default(),
             seccomp_filter: None,
+            process_cfg: process::ProcessCfg {
+                enabled: true,
+                max_per_session: 32,
+                buffer_bytes: 262_144,
+                idle_reap_sec: 3600,
+                kill_group: true,
+                force_unsupported: false,
+            },
         });
         (td, state)
     }
