@@ -670,6 +670,25 @@ fn tools_network_name() -> String {
     std::env::var("MINDBOX_TOOLS_NETWORK").unwrap_or_else(|_| "mindbox-tools".into())
 }
 
+/// Forward any TOOLS_PROCESS_* / TOOLS_MAX_PROCESSES_PER_SESSION /
+/// TOOLS_SESSION_IDLE_REAP_SEC env vars that the mindbox controller sees
+/// down into every spawned tools-rust container, so operators flip a single
+/// knob on mindbox to enable the eighth `process` tool inside the daemon.
+fn forward_tools_process_env() -> Vec<String> {
+    const KEYS: &[&str] = &[
+        "TOOLS_PROCESS_ENABLED",
+        "TOOLS_MAX_PROCESSES_PER_SESSION",
+        "TOOLS_PROCESS_BUFFER_BYTES",
+        "TOOLS_SESSION_IDLE_REAP_SEC",
+        "TOOLS_PROCESS_KILL_GROUP",
+        "TOOLS_PROCESS_FORCE_UNSUPPORTED",
+        "TOOLS_ISOLATION",
+    ];
+    KEYS.iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}")))
+        .collect()
+}
+
 /// Ensure a bridge-driver, attachable docker network with `tools_network_name()`
 /// exists. Returns Ok(()) whether the network was just created or already
 /// existed. This is the rendezvous point spawned tools containers and the
@@ -784,6 +803,7 @@ async fn start_tools_container(
         image: Some(tag),
         labels: Some(labels),
         exposed_ports: Some(exposed_ports),
+        env: Some(forward_tools_process_env()),
         host_config: Some(HostConfig {
             memory_reservation: Some(mem),
             cpu_shares: Some(1024),
@@ -1151,6 +1171,27 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var("MINDBOX_TOOLS_NETWORK", v),
             None => std::env::remove_var("MINDBOX_TOOLS_NETWORK"),
+        }
+    }
+
+    #[test]
+    fn forward_tools_process_env_only_forwards_set_keys() {
+        let prev = std::env::var("TOOLS_PROCESS_ENABLED").ok();
+        std::env::remove_var("TOOLS_PROCESS_ENABLED");
+        std::env::remove_var("TOOLS_PROCESS_BUFFER_BYTES");
+        let none = forward_tools_process_env();
+        assert!(
+            !none.iter().any(|s| s.starts_with("TOOLS_PROCESS_ENABLED=")),
+            "should not forward when unset: {none:?}"
+        );
+
+        std::env::set_var("TOOLS_PROCESS_ENABLED", "1");
+        let set = forward_tools_process_env();
+        assert!(set.iter().any(|s| s == "TOOLS_PROCESS_ENABLED=1"));
+
+        match prev {
+            Some(v) => std::env::set_var("TOOLS_PROCESS_ENABLED", v),
+            None => std::env::remove_var("TOOLS_PROCESS_ENABLED"),
         }
     }
 

@@ -1624,6 +1624,86 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
+    // 7.21 Process-group kill: a leader that forks a child sleeping; stop
+    //      should kill both leader and child (kill_group=true). We verify by
+    //      reading the child's pid from a file in the session cwd, then
+    //      checking that kill(pid, 0) returns ESRCH for both.
+    #[tokio::test]
+    async fn stop_kills_process_group() {
+        let td = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            sandbox_root: td.path().to_path_buf(),
+            session_root: td.path().to_path_buf(),
+            chroot_root: None,
+            sessions: DashMap::new(),
+            isolation: IsolationCfg::default(),
+            seccomp_filter: None,
+            process_cfg: ProcessCfg {
+                enabled: true,
+                max_per_session: 4,
+                buffer_bytes: 8 * 1024,
+                idle_reap_sec: 3600,
+                kill_group: true,
+                force_unsupported: false,
+            },
+        });
+        let cwd = state.sandbox_root.join("s");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        state
+            .sessions
+            .insert("s".to_string(), Arc::new(SessionState::new(cwd.clone())));
+
+        // Leader spawns a child sleep, records the child pid to a file, then
+        // blocks. kill_group=true ⇒ stop signals the whole group.
+        let script = "sleep 60 & echo $! > child.pid; wait";
+        let leader_pid_str = start_sh(&state, "s", script).await;
+        // Give the script time to spawn the child & write the file.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let child_pid_text = tokio::fs::read_to_string(cwd.join("child.pid"))
+            .await
+            .expect("child.pid written by leader");
+        let child_pid: i32 = child_pid_text.trim().parse().unwrap();
+
+        // Both PIDs alive before stop.
+        let leader_pid_num: i32 = {
+            let handle = state
+                .sessions
+                .get("s")
+                .unwrap()
+                .processes
+                .get(&leader_pid_str)
+                .unwrap()
+                .clone();
+            handle.pid as i32
+        };
+        let alive_pre_leader = unsafe { libc::kill(leader_pid_num, 0) } == 0;
+        let alive_pre_child = unsafe { libc::kill(child_pid, 0) } == 0;
+        assert!(alive_pre_leader && alive_pre_child, "both should be alive");
+
+        // Stop the leader; kill_group=true sends to -pgid.
+        let mut s = req(ProcessAction::Stop);
+        s.process_id = Some(leader_pid_str.clone());
+        s.timeout_sec = Some(0.5);
+        let resp = tool_process(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("s".into()),
+            axum::Json(s),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.0.running, Some(false));
+
+        // Both PIDs should now be ESRCH-dead.
+        // Give the kernel a tick to reap.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let alive_post_leader = unsafe { libc::kill(leader_pid_num, 0) } == 0;
+        let alive_post_child = unsafe { libc::kill(child_pid, 0) } == 0;
+        assert!(
+            !alive_post_leader && !alive_post_child,
+            "process-group kill should reap leader and child; leader_alive={alive_post_leader} child_alive={alive_post_child}"
+        );
+    }
+
     // 7.6 buffer truncation: child writes > buffer cap → next read sets
     //     truncated:true and contains the newest bytes.
     #[tokio::test]

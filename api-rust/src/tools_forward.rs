@@ -226,11 +226,23 @@ async fn v2_tool_call(
         )
             .into_response();
     }
-    let template = st
-        .sessions
-        .get(&sid)
-        .map(|r| r.clone())
-        .unwrap_or_else(|| FALLBACK_TEMPLATE.to_string());
+    let template = match st.sessions.get(&sid).map(|r| r.clone()) {
+        Some(t) => t,
+        None => {
+            // No sticky template for this sid means either it never existed
+            // or it was just deleted. Fall back to the legacy fallback daemon
+            // only when one is configured; otherwise 404 immediately so the
+            // caller observes "session and its process_ids are gone" instead
+            // of a 503 about unconfigured fallback.
+            match st.fallback_daemon.as_deref() {
+                Some(_) => FALLBACK_TEMPLATE.to_string(),
+                None => {
+                    return (StatusCode::NOT_FOUND, format!("session {sid} not found"))
+                        .into_response();
+                }
+            }
+        }
+    };
     match forward_to(
         &st,
         &template,
