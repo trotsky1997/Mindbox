@@ -214,6 +214,18 @@ async fn v2_tool_call(
     Path((sid, tool)): Path<(String, String)>,
     body: Body,
 ) -> impl IntoResponse {
+    // Gate the eighth "process" tool: even though tools-rust may serve it,
+    // the api-rust forward only exposes it to trusted callers (harness,
+    // bridge, debug). Default: 403. Flip TOOLS_EXPOSE_PROCESS=1 to enable.
+    if tool == "process" && !process_tool_exposed() {
+        let body = r#"{"code":"process_forbidden","message":"process tool is not agent-facing; set TOOLS_EXPOSE_PROCESS=1 on api-rust to enable"}"#;
+        return (
+            StatusCode::FORBIDDEN,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response();
+    }
     let template = st
         .sessions
         .get(&sid)
@@ -231,6 +243,15 @@ async fn v2_tool_call(
         Ok(r) => r,
         Err((s, m)) => (s, m).into_response(),
     }
+}
+
+/// Whether the api-rust forward should expose the eighth `process` tool to
+/// callers. Default off; flipped on per deployment by `TOOLS_EXPOSE_PROCESS`.
+fn process_tool_exposed() -> bool {
+    matches!(
+        std::env::var("TOOLS_EXPOSE_PROCESS").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
 }
 
 async fn v2_templates(State(st): State<Arc<ToolsForwardState>>) -> impl IntoResponse {
@@ -297,5 +318,17 @@ mod tests {
             .map(|s| s.trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty());
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn process_tool_exposed_defaults_off() {
+        // Make sure no neighbour test left the env set.
+        std::env::remove_var("TOOLS_EXPOSE_PROCESS");
+        assert!(!super::process_tool_exposed());
+        std::env::set_var("TOOLS_EXPOSE_PROCESS", "1");
+        assert!(super::process_tool_exposed());
+        std::env::set_var("TOOLS_EXPOSE_PROCESS", "0");
+        assert!(!super::process_tool_exposed());
+        std::env::remove_var("TOOLS_EXPOSE_PROCESS");
     }
 }

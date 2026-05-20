@@ -1,7 +1,7 @@
 ## 1. Scaffolding and config
 
 - [x] 1.1 Add new env knobs (`TOOLS_PROCESS_ENABLED`, `TOOLS_EXPOSE_PROCESS`, `TOOLS_MAX_PROCESSES_PER_SESSION` default 32, `TOOLS_PROCESS_BUFFER_BYTES` default 262144, `TOOLS_SESSION_IDLE_REAP_SEC` default 3600, `TOOLS_PROCESS_KILL_GROUP` default 1) to a single `ProcessCfg::from_env()` helper in `tools-rust/src/main.rs`
-- [ ] 1.2 Document the knobs in `README.md` and `.env.example` (default values, "trusted only" wording, "session-scoped lifetime" wording)
+- [x] 1.2 Document the knobs in `README.md` and `.env.example` (default values, "trusted only" wording, "session-scoped lifetime" wording)
 - [x] 1.3 Extract `tool_bash`'s sandbox `Command` build into a private helper `build_sandboxed_command(state, sid, cmd, args, env, cwd_override)`; rewrite `tool_bash` to call it (refactor with no behavior change)
 
 ## 2. Schema and HTTP plumbing
@@ -9,7 +9,7 @@
 - [x] 2.1 Add `ProcessReq`, `ProcessAction` (enum with snake_case), `ProcessEncoding`, `ProcessResult`, `ProcessSummary` types in `tools-rust/src/main.rs`
 - [x] 2.2 Enforce per-action mandatory-field rules and reject mismatches with `400` (unit-tested via `serde_json::from_value` + handler entry)
 - [x] 2.3 Add the `POST /sessions/:sid/tools/process` route; when `TOOLS_PROCESS_ENABLED` is unset return `404` ahead of any other parsing
-- [ ] 2.4 Add `api-rust/src/tools_forward.rs` gate: when `TOOLS_EXPOSE_PROCESS` is unset, route returns `403 {"code":"process_forbidden", ...}` before contacting upstream
+- [x] 2.4 Add `api-rust/src/tools_forward.rs` gate: when `TOOLS_EXPOSE_PROCESS` is unset, route returns `403 {"code":"process_forbidden", ...}` before contacting upstream
 
 ## 3. Session-embedded process registry
 
@@ -64,7 +64,7 @@
 
 ## 8. Docs and rollout
 
-- [ ] 8.1 Add a "Process tool (eighth, trusted-only)" section to `README.md` describing schema, gating, and the session-scoped lifetime contract (process_id dies with its session — explicit delete, idle reap, daemon shutdown, or template eviction)
+- [x] 8.1 Add a "Process tool (eighth, trusted-only)" section to `README.md` describing schema, gating, and the session-scoped lifetime contract (process_id dies with its session — explicit delete, idle reap, daemon shutdown, or template eviction)
 - [ ] 8.2 Add `tests/README.md` coverage row noting which scenarios cover the spec scenarios listed in `specs/tools-process-tool/spec.md`
 - [ ] 8.3 Update `bench/README.md` only if a relevant smoke target is added (skip otherwise)
 - [ ] 8.4 Verify the full suite: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --all-targets`

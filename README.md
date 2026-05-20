@@ -145,6 +145,39 @@ and `find.max_results`.
 Path validation: absolute paths and `..` traversal are rejected at the
 API boundary; everything is resolved relative to the session cwd.
 
+### Process tool (eighth, trusted-only)
+
+`POST /v2/sessions/:sid/tools/process` exposes a session-scoped persistent
+process primitive that bridges harness/SDK callers (sandbox MCP, language
+servers, dev-server smoke harnesses) to children running inside the
+session sandbox. It is **not** part of the seven agent-facing tools and
+is gated off by default:
+
+- Daemon kill switch: `TOOLS_PROCESS_ENABLED=1` on `tools-rust`.
+- Forward gate: `TOOLS_EXPOSE_PROCESS=1` on `api-rust`. Without it the
+  `/v2/.../tools/process` route returns `403 process_forbidden`
+  without contacting the daemon.
+
+Shape (action-tagged per EFP RFC 0001):
+
+```json
+{"action":"start", "command":"/bin/sh", "args":["-c","echo hi"]}
+{"action":"read",  "process_id":"...", "encoding":"utf-8|base64", "timeout_sec":0.5}
+{"action":"write", "process_id":"...", "input":"...", "eof":true}
+{"action":"signal","process_id":"...", "signal":"SIGTERM"}
+{"action":"wait",  "process_id":"...", "timeout_sec":30}
+{"action":"stop",  "process_id":"...", "timeout_sec":5}
+{"action":"list"}
+```
+
+Lifetime contract: `process_id` is **session-scoped**. When the owning
+session is gone — explicit `DELETE /v2/sessions/:sid`, daemon shutdown,
+or the idle reaper (`TOOLS_SESSION_IDLE_REAP_SEC`, default 1h) — every
+id it issued is immediately invalid. No checkpoint/restore, no
+cross-session attach. Per-session limits: `TOOLS_MAX_PROCESSES_PER_SESSION`
+(default 32) and `TOOLS_PROCESS_BUFFER_BYTES` (default 256 KiB) cap the
+ring buffer for each of stdout/stderr.
+
 ## Isolation (opt-in)
 
 `TOOLS_ISOLATION` env on the daemon picks any subset of
