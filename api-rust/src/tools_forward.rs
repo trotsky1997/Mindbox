@@ -28,10 +28,15 @@ pub struct ToolsForwardState {
     pub app: Arc<AppState>,
     pub fallback_daemon: Option<String>,
     pub client: reqwest::Client,
-    /// session_id → template name. Populated on POST /v2/sessions; consulted
-    /// for every subsequent route on that session. In-memory only — a
-    /// restarted api-rust forgets, daemons can be reached by direct hit.
-    pub sessions: dashmap::DashMap<String, String>,
+    /// session_id → (template name, sticky daemon URL).
+    ///
+    /// The daemon URL is captured at session-create time. Subsequent tool
+    /// calls for that sid go directly to the same daemon URL, NOT through
+    /// PagedRegistry round-robin. This matters when a template has
+    /// containers > 1: a session lives on exactly one of the daemon
+    /// replicas, and routing later requests to a sibling daemon would
+    /// return "session not found".
+    pub sessions: dashmap::DashMap<String, (String, String)>,
 }
 
 impl ToolsForwardState {
@@ -94,6 +99,16 @@ async fn forward_to(
     body: Body,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     let upstream = st.daemon_for(template).await?;
+    forward_to_url(st, &upstream, method, path, body).await
+}
+
+async fn forward_to_url(
+    st: &ToolsForwardState,
+    upstream: &str,
+    method: Method,
+    path: &str,
+    body: Body,
+) -> Result<axum::response::Response, (StatusCode, String)> {
     let url = format!("{}{}", upstream, path);
     let body_bytes = to_bytes(body, 8 * 1024 * 1024)
         .await
@@ -156,9 +171,17 @@ async fn v2_create_session(
     } else {
         req.template.clone()
     };
-    let forwarded = forward_to(
+    // Resolve daemon URL *once* at session-create time. The same URL is
+    // remembered on the sticky map and used for every follow-up tool call
+    // on this sid, so multi-instance templates do not bounce a session
+    // between sibling daemons.
+    let upstream = match st.daemon_for(&template).await {
+        Ok(u) => u,
+        Err((s, m)) => return (s, m).into_response(),
+    };
+    let forwarded = forward_to_url(
         &st,
-        &template,
+        &upstream,
         Method::POST,
         "/sessions",
         Body::from(body_bytes.clone()),
@@ -169,8 +192,8 @@ async fn v2_create_session(
         Err((s, m)) => return (s, m).into_response(),
     };
     // To dispatch follow-up calls on this session id, peek the returned
-    // body, extract session_id, and remember which template it belongs to.
-    // (resp.into_body() consumes resp so do that last.)
+    // body, extract session_id, and remember which (template, daemon URL)
+    // it belongs to. (resp.into_body() consumes resp so do that last.)
     let (parts, body) = resp.into_parts();
     let body_bytes = match to_bytes(body, 64 * 1024).await {
         Ok(b) => b,
@@ -179,7 +202,7 @@ async fn v2_create_session(
     if parts.status.is_success() {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
-                st.sessions.insert(sid.to_string(), template);
+                st.sessions.insert(sid.to_string(), (template, upstream));
             }
         }
     }
@@ -190,14 +213,21 @@ async fn v2_delete_session(
     State(st): State<Arc<ToolsForwardState>>,
     Path(sid): Path<String>,
 ) -> impl IntoResponse {
-    let template = st
-        .sessions
-        .remove(&sid)
-        .map(|(_, v)| v)
-        .unwrap_or_else(|| FALLBACK_TEMPLATE.to_string());
-    match forward_to(
+    // Use the sticky daemon URL captured at create time so we forward
+    // DELETE to the exact same daemon that owns the session state.
+    let url_opt = st.sessions.remove(&sid).map(|(_, v)| v.1);
+    let upstream = match url_opt {
+        Some(u) => u,
+        None => match st.fallback_daemon.clone() {
+            Some(u) => u,
+            None => {
+                return (StatusCode::NOT_FOUND, format!("session {sid} not found")).into_response();
+            }
+        },
+    };
+    match forward_to_url(
         &st,
-        &template,
+        &upstream,
         Method::DELETE,
         &format!("/sessions/{sid}"),
         Body::empty(),
@@ -226,16 +256,19 @@ async fn v2_tool_call(
         )
             .into_response();
     }
-    let template = match st.sessions.get(&sid).map(|r| r.clone()) {
-        Some(t) => t,
+    // Look up the sticky (template, daemon_url) captured at create time.
+    // Use the URL directly so a session pinned to instance N never gets
+    // bounced to instance M by round-robin.
+    let upstream = match st.sessions.get(&sid).map(|r| r.clone()) {
+        Some((_template, url)) => url,
         None => {
-            // No sticky template for this sid means either it never existed
+            // No sticky entry for this sid means either it never existed
             // or it was just deleted. Fall back to the legacy fallback daemon
             // only when one is configured; otherwise 404 immediately so the
             // caller observes "session and its process_ids are gone" instead
             // of a 503 about unconfigured fallback.
-            match st.fallback_daemon.as_deref() {
-                Some(_) => FALLBACK_TEMPLATE.to_string(),
+            match st.fallback_daemon.clone() {
+                Some(u) => u,
                 None => {
                     return (StatusCode::NOT_FOUND, format!("session {sid} not found"))
                         .into_response();
@@ -243,9 +276,9 @@ async fn v2_tool_call(
             }
         }
     };
-    match forward_to(
+    match forward_to_url(
         &st,
-        &template,
+        &upstream,
         Method::POST,
         &format!("/sessions/{sid}/tools/{tool}"),
         body,
