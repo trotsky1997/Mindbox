@@ -9,3 +9,8 @@ extra_apt = ["git"]
 # sandbox bash subprocess.
 # (template-builder doesn't run npm install for kind=tools yet; this
 # field is documentation-only for now.)
+
+# Optional runtime startup warmup. Disabled by default to keep cold starts cheap.
+# [warmup]
+# commands = ["node -e 'console.log(\"warm\")'"]
+# timeout_secs = 30

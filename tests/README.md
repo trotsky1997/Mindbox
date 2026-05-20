@@ -21,9 +21,9 @@ cargo test --workspace --all-targets
 
 | Crate | Coverage |
 |---|---|
-| `api-rust` | template loading, memory parsing, PagedRegistry state transitions |
+| `api-rust` | template loading, warmup config/result helpers, memory parsing, PagedRegistry state transitions |
 | `e2b-shim` | E2B-compatible request/response helpers, Connect envelopes, path/body parsing |
-| `template-builder` | template config parsing and image-name logic |
+| `template-builder` | template config/warmup parsing and image-name logic |
 | `tools-rust` | session path validation, seven-tool schemas, read/write/edit/ls/grep/find/bash behavior, isolation helpers |
 
 ## Integration testing
@@ -37,4 +37,6 @@ as unit tests. Useful smoke coverage is:
 3. Start `api-rust` with Docker access.
 4. Create a `/v2/sessions` session.
 5. Exercise all seven `/v2/sessions/:sid/tools/:tool` endpoints with canonical request bodies.
-6. Optionally verify `e2b-shim` with `commands.run`, `files.read`, and `files.write`.
+6. For warmup, add a temporary `[warmup]` command to a template and confirm logs show health, warmup success, then `COLD→HOT`.
+7. Test a failing warmup command and confirm the failed container is removed instead of registered Hot.
+8. Optionally verify `e2b-shim` with `commands.run`, `files.read`, and `files.write`.

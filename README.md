@@ -55,6 +55,27 @@ Image tag: `inspect-tpl-tools-<name>:latest`. Build a new template with
 `template-build <name>` (run from the mindbox image, with templates/
 mounted).
 
+### Template startup warmup
+
+Templates may define startup warmup commands. api-rust runs them once per newly
+started tools container after `/health` succeeds and before the template becomes
+Hot in `PagedRegistry`:
+
+```toml
+[warmup]
+commands = [
+  "python - <<'PY'\nimport pytest, rich\nPY",
+]
+timeout_secs = 30
+```
+
+Warmup uses a transient tools-rust session and calls the `bash` tool with each
+command. The transient session is deleted afterwards. Commands run as separate
+`bash -c` invocations, so combine commands when shell state must persist.
+Warmup reruns when a container is newly started from Cold; Docker pause/unpause
+from Warm to Hot keeps the same warmed container and does not rerun warmup. This
+is container/page-cache warmup, not fork/CRIU process prewarm.
+
 ## Quick start
 
 ```bash

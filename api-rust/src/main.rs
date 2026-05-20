@@ -63,6 +63,25 @@ struct TemplateConfig {
     #[serde(default = "default_engine")]
     #[allow(dead_code)]
     engine: String,
+    #[serde(default)]
+    warmup: WarmupConfig,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct WarmupConfig {
+    #[serde(default)]
+    commands: Vec<String>,
+    #[serde(default = "default_warmup_timeout_secs")]
+    timeout_secs: u64,
+}
+
+impl Default for WarmupConfig {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            timeout_secs: default_warmup_timeout_secs(),
+        }
+    }
 }
 fn default_kind() -> String {
     "tools".into()
@@ -81,6 +100,9 @@ fn default_pids_limit() -> i64 {
 }
 fn default_engine() -> String {
     "rust".into()
+}
+fn default_warmup_timeout_secs() -> u64 {
+    30
 }
 
 // ---- runtime state ------------------------------------------------------
@@ -253,9 +275,18 @@ impl PagedRegistry {
         let mut container_ids = Vec::new();
         let mut daemon_urls = Vec::new();
         for i in 0..cfg.containers.max(1) {
-            let (cid, url) = start_tools_container(&self.docker, &cfg, i).await?;
-            container_ids.push(cid);
-            daemon_urls.push(url);
+            match start_tools_container(&self.docker, &cfg, i).await {
+                Ok((cid, url)) => {
+                    container_ids.push(cid);
+                    daemon_urls.push(url);
+                }
+                Err(e) => {
+                    for cid in &container_ids {
+                        remove_container_best_effort(&self.docker, cid).await;
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         let rt = Arc::new(TemplateRuntime {
@@ -464,6 +495,174 @@ fn parse_memory(s: &str) -> Result<i64> {
     Ok(num.trim().parse::<i64>()? * mult)
 }
 
+fn effective_warmup_timeout_secs(raw: u64) -> u64 {
+    raw.clamp(1, 300)
+}
+
+fn truncate_warmup_output(s: &str) -> String {
+    const MAX: usize = 512;
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    format!("{}…", &s[..MAX])
+}
+
+#[derive(Deserialize, Debug)]
+struct WarmupCreateSessionResp {
+    session_id: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct WarmupBashResp {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    #[serde(default)]
+    timed_out: bool,
+}
+
+fn validate_warmup_bash_result(
+    template: &str,
+    idx: usize,
+    command_index: usize,
+    resp: &WarmupBashResp,
+) -> Result<()> {
+    if resp.timed_out {
+        return Err(anyhow!(
+            "template {template} replica {idx} warmup command {command_index} timed out"
+        ));
+    }
+    if resp.exit_code != 0 {
+        return Err(anyhow!(
+            "template {template} replica {idx} warmup command {command_index} failed with exit {} stderr={} stdout={}",
+            resp.exit_code,
+            truncate_warmup_output(&resp.stderr),
+            truncate_warmup_output(&resp.stdout),
+        ));
+    }
+    Ok(())
+}
+
+async fn remove_container_best_effort(docker: &Docker, cid: &str) {
+    let _ = docker
+        .remove_container(
+            cid,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+}
+
+async fn run_template_warmup(daemon_url: &str, cfg: &TemplateConfig, idx: usize) -> Result<()> {
+    if cfg.warmup.commands.is_empty() {
+        return Ok(());
+    }
+    let timeout_secs = effective_warmup_timeout_secs(cfg.warmup.timeout_secs);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs + 5))
+        .build()
+        .context("warmup reqwest client")?;
+
+    eprintln!(
+        "[paged] warmup start template={} replica={} commands={}",
+        cfg.name,
+        idx,
+        cfg.warmup.commands.len()
+    );
+
+    let create_resp = client
+        .post(format!("{daemon_url}/sessions"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .context("create warmup session")?;
+    if !create_resp.status().is_success() {
+        let status = create_resp.status();
+        let body = create_resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "template {} replica {} warmup session create failed: HTTP {} {}",
+            cfg.name,
+            idx,
+            status,
+            truncate_warmup_output(&body)
+        ));
+    }
+    let session: WarmupCreateSessionResp = create_resp
+        .json()
+        .await
+        .context("decode warmup session response")?;
+
+    let mut warmup_result: Result<()> = Ok(());
+    for (command_index, command) in cfg.warmup.commands.iter().enumerate() {
+        let resp = client
+            .post(format!(
+                "{daemon_url}/sessions/{}/tools/bash",
+                session.session_id
+            ))
+            .json(&serde_json::json!({
+                "command": command,
+                "timeout": timeout_secs,
+            }))
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "template {} replica {} warmup command {} HTTP request",
+                    cfg.name, idx, command_index
+                )
+            });
+
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(e) => {
+                warmup_result = Err(e);
+                break;
+            }
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warmup_result = Err(anyhow!(
+                "template {} replica {} warmup command {} returned HTTP {} {}",
+                cfg.name,
+                idx,
+                command_index,
+                status,
+                truncate_warmup_output(&body)
+            ));
+            break;
+        }
+        let bash: WarmupBashResp = match resp.json().await {
+            Ok(body) => body,
+            Err(e) => {
+                warmup_result = Err(e).context("decode warmup bash response");
+                break;
+            }
+        };
+        if let Err(e) = validate_warmup_bash_result(&cfg.name, idx, command_index, &bash) {
+            warmup_result = Err(e);
+            break;
+        }
+    }
+
+    if let Err(e) = client
+        .delete(format!("{daemon_url}/sessions/{}", session.session_id))
+        .send()
+        .await
+    {
+        eprintln!(
+            "[paged] warmup cleanup failed template={} replica={} sid={}: {}",
+            cfg.name, idx, session.session_id, e
+        );
+    }
+
+    warmup_result?;
+    eprintln!("[paged] warmup ok template={} replica={}", cfg.name, idx);
+    Ok(())
+}
+
 /// Spawn a tools-rust daemon container for the given template. The image
 /// must be tagged `inspect-tpl-tools-<cfg.name>:latest` (template-builder
 /// `kind="tools"` adds the "tools-" prefix). The container exposes 8002 to
@@ -547,24 +746,33 @@ async fn start_tools_container(
         )
         .await
         .context("create tools container")?;
-    docker
+    if let Err(e) = docker
         .start_container(&created.id, None::<StartContainerOptions<String>>)
         .await
-        .context("start tools container")?;
+    {
+        remove_container_best_effort(docker, &created.id).await;
+        return Err(e).context("start tools container");
+    }
 
     // Inspect to learn the assigned host port.
-    let inspected = docker
-        .inspect_container(&created.id, None)
-        .await
-        .context("inspect tools container")?;
-    let host_port = inspected
+    let inspected = match docker.inspect_container(&created.id, None).await {
+        Ok(inspected) => inspected,
+        Err(e) => {
+            remove_container_best_effort(docker, &created.id).await;
+            return Err(e).context("inspect tools container");
+        }
+    };
+    let Some(host_port) = inspected
         .network_settings
         .as_ref()
         .and_then(|ns| ns.ports.as_ref())
         .and_then(|p| p.get("8002/tcp").cloned().flatten())
         .and_then(|v| v.into_iter().next())
         .and_then(|pb| pb.host_port)
-        .ok_or_else(|| anyhow!("tools container has no published 8002/tcp port"))?;
+    else {
+        remove_container_best_effort(docker, &created.id).await;
+        return Err(anyhow!("tools container has no published 8002/tcp port"));
+    };
     let daemon_url = format!("http://127.0.0.1:{}", host_port);
 
     // Wait for /health to return 200.
@@ -576,15 +784,21 @@ async fn start_tools_container(
     let mut last_err: Option<String> = None;
     loop {
         if std::time::Instant::now() >= deadline {
-            return Err(anyhow!(
+            let err = anyhow!(
                 "tools daemon at {} not ready in 30s: {}",
                 daemon_url,
                 last_err.unwrap_or_else(|| "no probe attempts".into())
-            ));
+            );
+            remove_container_best_effort(docker, &created.id).await;
+            return Err(err);
         }
         match client.get(format!("{}/health", daemon_url)).send().await {
             Ok(r) if r.status().is_success() => {
                 eprintln!("[paged] tools daemon ready at {}", daemon_url);
+                if let Err(e) = run_template_warmup(&daemon_url, cfg, idx).await {
+                    remove_container_best_effort(docker, &created.id).await;
+                    return Err(e);
+                }
                 return Ok((created.id, daemon_url));
             }
             Ok(r) => last_err = Some(format!("HTTP {}", r.status())),
@@ -787,6 +1001,57 @@ mod tests {
         assert!(parse_memory("").is_err());
     }
 
+    #[test]
+    fn effective_warmup_timeout_is_clamped_to_bash_range() {
+        assert_eq!(effective_warmup_timeout_secs(0), 1);
+        assert_eq!(effective_warmup_timeout_secs(30), 30);
+        assert_eq!(effective_warmup_timeout_secs(999), 300);
+    }
+
+    #[test]
+    fn validate_warmup_bash_result_accepts_success() {
+        let resp = WarmupBashResp {
+            stdout: "ok".into(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+        };
+        validate_warmup_bash_result("tpl", 0, 0, &resp).unwrap();
+    }
+
+    #[test]
+    fn validate_warmup_bash_result_rejects_nonzero_exit() {
+        let resp = WarmupBashResp {
+            stdout: "out".into(),
+            stderr: "err".into(),
+            exit_code: 2,
+            timed_out: false,
+        };
+        let err = validate_warmup_bash_result("tpl", 1, 2, &resp).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("tpl"));
+        assert!(msg.contains("replica 1"));
+        assert!(msg.contains("command 2"));
+        assert!(msg.contains("exit 2"));
+    }
+
+    #[test]
+    fn validate_warmup_bash_result_rejects_timeout() {
+        let resp = WarmupBashResp {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 124,
+            timed_out: true,
+        };
+        let err = validate_warmup_bash_result("tpl", 0, 1, &resp).unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn truncate_warmup_output_keeps_short_text() {
+        assert_eq!(truncate_warmup_output("short"), "short");
+    }
+
     // ---- send_frame / recv_frame ---------------------------------------
     //
     // 4-byte u32 BE length prefix + payload. MAX_FRAME = 64 MiB.
@@ -854,6 +1119,32 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].name, "hello");
         assert_eq!(v[0].containers, 2);
+        assert!(v[0].warmup.commands.is_empty());
+        assert_eq!(v[0].warmup.timeout_secs, 30);
+    }
+
+    #[test]
+    fn load_templates_reads_warmup_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("warm");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(
+            sub.join("template.toml"),
+            r#"name = "warm"
+
+[warmup]
+commands = ["echo warm", "python -c 'print(1)'"]
+timeout_secs = 45
+"#,
+        )
+        .unwrap();
+        let v = load_templates(dir.path()).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(
+            v[0].warmup.commands,
+            vec!["echo warm", "python -c 'print(1)'"]
+        );
+        assert_eq!(v[0].warmup.timeout_secs, 45);
     }
 
     #[test]

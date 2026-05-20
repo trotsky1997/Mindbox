@@ -54,6 +54,18 @@ struct TemplateCfg {
     /// way to install bash/ripgrep/fd/etc into the image.
     #[serde(default)]
     extra_apt: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    warmup: WarmupConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct WarmupConfig {
+    #[serde(default)]
+    commands: Vec<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
 fn default_base() -> String {
     "python:3.12-slim".into()
@@ -74,8 +86,8 @@ fn build(root: &Path, name: &str) -> Result<()> {
 
 /// Generate + docker-build a kind="tools" template image: thin debian-slim
 /// base with apt packages from extra_apt and the tools-rust daemon binary.
-/// No Python pool, no prewarm, no protobuf — sessions are managed inside
-/// the daemon as cwd subdirs.
+/// Runtime warmup is handled by api-rust after the daemon starts; template-builder
+/// only validates that the warmup config parses.
 fn build_tools(root: &Path, tpl_dir: &Path, name: &str, cfg: &TemplateCfg) -> Result<()> {
     let tag = format!("inspect-tpl-tools-{}:latest", name);
     let tools_bin = root.join("tools-rust/target/release/tools-rust");
@@ -229,6 +241,24 @@ mod tests {
         assert_eq!(cfg.name, ""); // default_name = empty
         assert_eq!(cfg.base_image, default_base()); // python:3.12-slim
         assert!(cfg.extra_apt.is_empty());
+        assert!(cfg.warmup.commands.is_empty());
+        assert_eq!(cfg.warmup.timeout_secs, None);
+    }
+
+    #[test]
+    fn template_cfg_accepts_warmup_config() {
+        let cfg: TemplateCfg = toml::from_str(
+            r#"
+name = "py"
+
+[warmup]
+commands = ["python -c 'import pytest'"]
+timeout_secs = 45
+"#,
+        )
+        .expect("parse warmup");
+        assert_eq!(cfg.warmup.commands, vec!["python -c 'import pytest'"]);
+        assert_eq!(cfg.warmup.timeout_secs, Some(45));
     }
 
     #[test]

@@ -9,3 +9,8 @@ base_image = "python:3.12-slim"
 # by template-builder automatically.
 extra_apt = ["git"]
 extra_pip = ["uv", "pytest", "rich"]
+
+# Optional runtime startup warmup. Disabled by default to keep cold starts cheap.
+# [warmup]
+# commands = ["python - <<'PY'\nimport pytest, rich\nPY"]
+# timeout_secs = 30
