@@ -1,0 +1,6 @@
+[submodule "third-party/infra"]
+	path = third-party/infra
+	url = https://github.com/e2b-dev/infra
+[submodule "third-party/E2B"]
+	path = third-party/E2B
+	url = https://github.com/e2b-dev/E2B.git
