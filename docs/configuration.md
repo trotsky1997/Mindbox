@@ -69,6 +69,8 @@ The 8th-tool design is detailed in `openspec/specs/tools-process-tool/spec.md`.
 | `E2B_SHIM_UPSTREAM` | `http://127.0.0.1:8000` | Where to forward `commands.run / files.read / files.write` etc. Usually the colocated api-rust. |
 | `E2B_SHIM_API_KEY` | unset | If set, incoming requests must include this E2B-style API key. |
 | `E2B_SHIM_DEFAULT_SANDBOX` | unset | Optional default sandbox id used when an SDK client doesn't supply one. |
+| `E2B_SHIM_BASE_TEMPLATE` | `tools-default` | Template to use when the E2B SDK asks for its default `base` template. |
+| `E2B_SHIM_VOLUMES_ROOT` | `/var/lib/e2b-shim/volumes` | Host directory where shim-managed E2B volume content is stored. |
 
 ## TOS / S3 object storage
 

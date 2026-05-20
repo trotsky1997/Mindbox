@@ -29,6 +29,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -73,6 +74,8 @@ struct SandboxRec {
     disk_size_mb: u32,
     #[serde(default = "default_state")]
     state: String,
+    #[serde(rename = "volumeMounts", default)]
+    volume_mounts: Vec<SandboxVolumeMount>,
 }
 
 fn default_cpu() -> u32 {
@@ -86,6 +89,20 @@ fn default_disk() -> u32 {
 }
 fn default_state() -> String {
     "running".into()
+}
+
+fn effective_template_id(template_id: &str) -> String {
+    let raw = if template_id.is_empty() {
+        "base"
+    } else {
+        template_id
+    };
+    match raw {
+        "base" => {
+            std::env::var("E2B_SHIM_BASE_TEMPLATE").unwrap_or_else(|_| "tools-default".to_string())
+        }
+        other => other.to_string(),
+    }
 }
 
 /// Forward a single tool call to the tools-rust daemon via api-rust's /v2
@@ -131,6 +148,10 @@ async fn forward_tools_tool(
 /// but we get a clearer 502 boundary by trimming here too.)
 fn tools_relative_path(p: &str) -> String {
     p.trim_start_matches('/').to_string()
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
 /// 501 response shape that e2b SDK consumers (or curl) can read as a
@@ -188,6 +209,270 @@ fn sandbox_fs_dir(sid: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(SANDBOX_FS_ROOT).join(sid)
 }
 
+fn clean_rel_path(p: &str) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for part in std::path::Path::new(p.trim_start_matches('/')).components() {
+        match part {
+            std::path::Component::Normal(seg) => out.push(seg),
+            std::path::Component::CurDir => {}
+            _ => {}
+        }
+    }
+    out
+}
+
+fn volume_fs_dir(volume_id: &str) -> std::path::PathBuf {
+    volumes_root().join(volume_id)
+}
+
+fn volume_path(volume_id: &str, path: &str) -> std::path::PathBuf {
+    volume_fs_dir(volume_id).join(clean_rel_path(path))
+}
+
+fn unix_mode(md: &std::fs::Metadata) -> u32 {
+    md.mode() & 0o7777
+}
+
+fn entry_stat_json(
+    path: &std::path::Path,
+    logical_path: &str,
+) -> std::io::Result<serde_json::Value> {
+    let md = std::fs::symlink_metadata(path)?;
+    let ft = md.file_type();
+    let typ = if ft.is_dir() {
+        "directory"
+    } else if ft.is_symlink() {
+        "symlink"
+    } else if ft.is_file() {
+        "file"
+    } else {
+        "unknown"
+    };
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ts =
+        chrono::DateTime::<Utc>::from(md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH))
+            .to_rfc3339();
+    Ok(serde_json::json!({
+        "name": name,
+        "type": typ,
+        "path": if logical_path.starts_with('/') { logical_path.to_string() } else { format!("/{}", logical_path) },
+        "size": md.len(),
+        "mode": unix_mode(&md),
+        "uid": md.uid(),
+        "gid": md.gid(),
+        "atime": ts,
+        "mtime": ts,
+        "ctime": ts,
+    }))
+}
+
+fn validate_volume_mounts(
+    state: &AppState,
+    mounts: &[SandboxVolumeMount],
+) -> Result<Vec<(SandboxVolumeMount, VolumeRec)>, (StatusCode, String)> {
+    let mut out = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        if mount.name.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                r#"{"code":"bad_request","message":"volume mount name is required"}"#.into(),
+            ));
+        }
+        if mount.path.is_empty() || !mount.path.starts_with('/') {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    r#"{{"code":"bad_request","message":"volume mount path must be absolute: {}"}}"#,
+                    mount.path
+                ),
+            ));
+        }
+        let rec = state
+            .volumes
+            .iter()
+            .find(|r| r.value().name == mount.name || r.value().volume_id == mount.name)
+            .map(|r| r.value().clone())
+            .ok_or((
+                StatusCode::NOT_FOUND,
+                format!(
+                    r#"{{"code":"not_found","message":"volume {} not found"}}"#,
+                    mount.name
+                ),
+            ))?;
+        out.push((mount.clone(), rec));
+    }
+    Ok(out)
+}
+
+async fn materialize_volume_mounts(
+    state: &AppState,
+    sid: &str,
+    mounts: &[(SandboxVolumeMount, VolumeRec)],
+) -> Result<(), (StatusCode, String)> {
+    for (mount, vol) in mounts {
+        copy_volume_to_tools_session(state, sid, &vol.volume_id, &mount.path).await?;
+    }
+    Ok(())
+}
+
+fn rewrite_command_mount_paths(state: &AppState, sid: Option<&str>, command: String) -> String {
+    let Some(sid) = sid else {
+        return command;
+    };
+    let Some(rec) = state.sandboxes.get(sid) else {
+        return command;
+    };
+    let mut mounts = rec.volume_mounts.clone();
+    mounts.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+    let mut out = command;
+    for mount in mounts {
+        let from = mount.path.trim_end_matches('/');
+        if from.is_empty() {
+            continue;
+        }
+        let to = tools_relative_path(from);
+        if !to.is_empty() {
+            out = out.replace(from, &to);
+        }
+    }
+    out
+}
+
+async fn copy_volume_to_tools_session(
+    state: &AppState,
+    sid: &str,
+    volume_id: &str,
+    mount_path: &str,
+) -> Result<(), (StatusCode, String)> {
+    let src = volume_fs_dir(volume_id);
+    if !src.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                r#"{{"code":"not_found","message":"volume {} not found"}}"#,
+                volume_id
+            ),
+        ));
+    }
+    let dst_rel = tools_relative_path(mount_path);
+    let rm_cmd = format!(
+        "rm -rf -- {} && mkdir -p -- {}",
+        shell_quote(&dst_rel),
+        shell_quote(&dst_rel)
+    );
+    run_tools_bash(state, sid, &rm_cmd, 30).await?;
+    copy_dir_to_tools(state, sid, &src, &dst_rel).await
+}
+
+async fn copy_dir_to_tools(
+    state: &AppState,
+    sid: &str,
+    src: &std::path::Path,
+    dst_rel: &str,
+) -> Result<(), (StatusCode, String)> {
+    let mut stack = vec![(src.to_path_buf(), dst_rel.to_string())];
+    while let Some((dir, rel)) = stack.pop() {
+        let mkdir_cmd = format!("mkdir -p -- {}", shell_quote(&rel));
+        run_tools_bash(state, sid, &mkdir_cmd, 30).await?;
+        let rd = std::fs::read_dir(&dir).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    r#"{{"code":"internal","message":"read volume dir: {}"}}"#,
+                    e
+                ),
+            )
+        })?;
+        for ent in rd.flatten() {
+            let path = ent.path();
+            let child_rel = format!(
+                "{}/{}",
+                rel.trim_end_matches('/'),
+                ent.file_name().to_string_lossy()
+            );
+            let md = match ent.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if md.is_dir() {
+                stack.push((path, child_rel));
+            } else if md.is_file() {
+                let bytes = std::fs::read(&path).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            r#"{{"code":"internal","message":"read volume file: {}"}}"#,
+                            e
+                        ),
+                    )
+                })?;
+                write_tools_file(state, sid, &child_rel, bytes).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn write_tools_file(
+    state: &AppState,
+    sid: &str,
+    rel: &str,
+    bytes: Vec<u8>,
+) -> Result<(), (StatusCode, String)> {
+    let b64 = general_b64(&bytes);
+    let cmd = format!(
+        "mkdir -p -- $(dirname -- {}) && base64 -d > {} <<'EOF'\n{}\nEOF",
+        shell_quote(rel),
+        shell_quote(rel),
+        b64
+    );
+    run_tools_bash(state, sid, &cmd, 120).await.map(|_| ())
+}
+
+#[derive(serde::Deserialize)]
+struct ToolsBashResp {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    #[serde(default)]
+    timed_out: bool,
+}
+
+async fn run_tools_bash(
+    state: &AppState,
+    sid: &str,
+    command: &str,
+    timeout: u64,
+) -> Result<ToolsBashResp, (StatusCode, String)> {
+    let url = format!("{}/v2/sessions/{}/tools/bash", state.upstream, sid);
+    let resp = state
+        .http
+        .post(&url)
+        .json(&serde_json::json!({ "command": command, "timeout": timeout }))
+        .timeout(Duration::from_secs(timeout.saturating_add(30).max(30)))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("tools bash: {}", e)))?;
+    let status = resp.status();
+    let body: ToolsBashResp = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("tools bash json: {}", e)))?;
+    if !status.is_success() || body.exit_code != 0 || body.timed_out {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                r#"{{"code":"bad_gateway","message":"tools bash failed status={} exit={} timed_out={} stderr={:?} stdout={:?}"}}"#,
+                status, body.exit_code, body.timed_out, body.stderr, body.stdout
+            ),
+        ));
+    }
+    Ok(body)
+}
+
 struct AppState {
     sandboxes: DashMap<String, SandboxRec>,
     upstream: String,
@@ -206,6 +491,8 @@ struct VolumeRec {
     #[serde(rename = "volumeID")]
     volume_id: String,
     name: String,
+    #[serde(default)]
+    token: String,
     #[serde(rename = "sizeMB", default = "default_vol_size")]
     size_mb: u32,
     #[serde(rename = "createdAt")]
@@ -298,6 +585,14 @@ struct NewSandbox {
     #[serde(default)]
     #[allow(dead_code)]
     env_vars: Option<serde_json::Value>,
+    #[serde(rename = "volumeMounts", default)]
+    volume_mounts: Vec<SandboxVolumeMount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SandboxVolumeMount {
+    name: String,
+    path: String,
 }
 
 async fn check_api_key(
@@ -332,12 +627,9 @@ async fn create_sandbox(
     Json(body): Json<NewSandbox>,
 ) -> Result<(StatusCode, Json<SandboxRec>), (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
+    let volume_mounts = validate_volume_mounts(&state, &body.volume_mounts)?;
 
-    let template_id = if body.template_id.is_empty() {
-        "default".to_string()
-    } else {
-        body.template_id.clone()
-    };
+    let template_id = effective_template_id(&body.template_id);
 
     // Daemon allocates the session id; use it as the e2b sandbox_id.
     let sid = {
@@ -368,6 +660,11 @@ async fn create_sandbox(
                 "upstream /v2/sessions: missing session_id".into(),
             ))?
     };
+    if let Err(e) = materialize_volume_mounts(&state, &sid, &volume_mounts).await {
+        let url = format!("{}/v2/sessions/{}", state.upstream, sid);
+        let _ = state.http.delete(&url).send().await;
+        return Err(e);
+    }
     let now = Utc::now();
     let end = now + chrono::Duration::seconds(body.timeout.unwrap_or(900) as i64);
     let rec = SandboxRec {
@@ -390,6 +687,7 @@ async fn create_sandbox(
         memory_mb: 1024,
         disk_size_mb: 4096,
         state: "running".into(),
+        volume_mounts: body.volume_mounts.clone(),
     };
 
     state.sandboxes.insert(sid.clone(), rec.clone());
@@ -668,6 +966,7 @@ async fn process_start(
     } else {
         format!("{} {}", proc_cfg.cmd, proc_cfg.args.join(" "))
     };
+    let bash_cmd = rewrite_command_mount_paths(&state, sid.as_deref(), bash_cmd);
     process_start_tools(state, codec, sid, bash_cmd).await
 }
 
@@ -1011,13 +1310,23 @@ async fn fs_move(
 
 // ---- /files (HTTP path-based read/write) -------------------------------
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct FilesQuery {
     #[serde(default)]
     path: String,
     #[serde(default)]
     #[allow(dead_code)]
     username: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct VolumePathQuery {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    force: Option<bool>,
+    #[serde(default)]
+    depth: Option<u32>,
 }
 
 async fn files_get(
@@ -2146,7 +2455,13 @@ async fn tags_get(
 // pool). Users can still address volumes via the host fs dir; mounting into
 // commands is a future extension.
 
-const VOLUMES_ROOT: &str = "/var/lib/e2b-shim/volumes";
+const DEFAULT_VOLUMES_ROOT: &str = "/var/lib/e2b-shim/volumes";
+
+fn volumes_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("E2B_SHIM_VOLUMES_ROOT").unwrap_or_else(|_| DEFAULT_VOLUMES_ROOT.into()),
+    )
+}
 
 #[derive(serde::Deserialize)]
 struct CreateVolumeBody {
@@ -2167,10 +2482,19 @@ async fn volumes_create(
     let rec = VolumeRec {
         volume_id: vol_id.clone(),
         name,
+        token: uuid::Uuid::new_v4().to_string(),
         size_mb: body.size_mb.unwrap_or(1024),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    let _ = std::fs::create_dir_all(format!("{}/{}", VOLUMES_ROOT, vol_id));
+    std::fs::create_dir_all(volume_fs_dir(&vol_id)).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                r#"{{"code":"internal","message":"create volume dir: {}"}}"#,
+                e
+            ),
+        )
+    })?;
     state.volumes.insert(vol_id.clone(), rec.clone());
     Ok((StatusCode::CREATED, Json(rec)))
 }
@@ -2206,8 +2530,234 @@ async fn volume_delete(
 ) -> Result<StatusCode, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
     state.volumes.remove(&vid);
-    let _ = std::fs::remove_dir_all(format!("{}/{}", VOLUMES_ROOT, vid));
+    let _ = std::fs::remove_dir_all(volume_fs_dir(&vid));
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn volume_rec(state: &AppState, vid: &str) -> Result<VolumeRec, (StatusCode, String)> {
+    state.volumes.get(vid).map(|r| r.clone()).ok_or((
+        StatusCode::NOT_FOUND,
+        format!(
+            r#"{{"code":"not_found","message":"volume {} not found"}}"#,
+            vid
+        ),
+    ))
+}
+
+async fn check_volume_auth(
+    _state: &AppState,
+    headers: &HeaderMap,
+    vol: &VolumeRec,
+) -> Result<(), (StatusCode, String)> {
+    let got = headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|h| h.to_str().ok()));
+    if got == Some(vol.token.as_str()) {
+        return Ok(());
+    }
+    if !vol.token.is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            r#"{"code":"unauthenticated","message":"invalid volume token"}"#.into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn volume_file_put(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vid): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<VolumePathQuery>,
+    body: Bytes,
+) -> Response {
+    let vol = match volume_rec(&state, &vid) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = check_volume_auth(&state, &headers, &vol).await {
+        return e.into_response();
+    }
+    let path = volume_path(&vid, &q.path);
+    if path.exists() && q.force == Some(false) {
+        return (
+            StatusCode::CONFLICT,
+            r#"{"code":"already_exists","message":"path already exists"}"#,
+        )
+            .into_response();
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {}", e)).into_response();
+        }
+    }
+    if let Err(e) = std::fs::write(&path, &body) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {}", e)).into_response();
+    }
+    match entry_stat_json(&path, &q.path) {
+        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("stat: {}", e)).into_response(),
+    }
+}
+
+async fn volume_file_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vid): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<VolumePathQuery>,
+) -> Response {
+    let vol = match volume_rec(&state, &vid) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = check_volume_auth(&state, &headers, &vol).await {
+        return e.into_response();
+    }
+    let path = volume_path(&vid, &q.path);
+    match std::fs::read(&path) {
+        Ok(b) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            b,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, format!("not found: {}", e)).into_response(),
+    }
+}
+
+async fn volume_dir_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vid): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<VolumePathQuery>,
+) -> Response {
+    let vol = match volume_rec(&state, &vid) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = check_volume_auth(&state, &headers, &vol).await {
+        return e.into_response();
+    }
+    let path = volume_path(&vid, &q.path);
+    let res = if q.force.unwrap_or(true) {
+        std::fs::create_dir_all(&path)
+    } else {
+        std::fs::create_dir(&path)
+    };
+    if let Err(e) = res {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {}", e)).into_response();
+    }
+    match entry_stat_json(&path, &q.path) {
+        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("stat: {}", e)).into_response(),
+    }
+}
+
+async fn volume_dir_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vid): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<VolumePathQuery>,
+) -> Response {
+    let vol = match volume_rec(&state, &vid) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = check_volume_auth(&state, &headers, &vol).await {
+        return e.into_response();
+    }
+    let path = volume_path(&vid, &q.path);
+    let mut out = Vec::new();
+    let rd = match std::fs::read_dir(&path) {
+        Ok(rd) => rd,
+        Err(e) => return (StatusCode::NOT_FOUND, format!("list: {}", e)).into_response(),
+    };
+    for ent in rd.flatten() {
+        let logical = format!(
+            "{}/{}",
+            q.path.trim_end_matches('/'),
+            ent.file_name().to_string_lossy()
+        );
+        if let Ok(v) = entry_stat_json(&ent.path(), &logical) {
+            out.push(v);
+        }
+    }
+    if q.depth.unwrap_or(1) > 1 {
+        out.sort_by(|a, b| {
+            a.get("path")
+                .and_then(|v| v.as_str())
+                .cmp(&b.get("path").and_then(|v| v.as_str()))
+        });
+    }
+    (StatusCode::OK, Json(out)).into_response()
+}
+
+async fn volume_path_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vid): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<VolumePathQuery>,
+) -> Response {
+    let vol = match volume_rec(&state, &vid) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = check_volume_auth(&state, &headers, &vol).await {
+        return e.into_response();
+    }
+    let path = volume_path(&vid, &q.path);
+    match entry_stat_json(&path, &q.path) {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, format!("not found: {}", e)).into_response(),
+    }
+}
+
+async fn volume_path_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vid): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<VolumePathQuery>,
+) -> Response {
+    let vol = match volume_rec(&state, &vid) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = check_volume_auth(&state, &headers, &vol).await {
+        return e.into_response();
+    }
+    let path = volume_path(&vid, &q.path);
+    let res = if path.is_dir() {
+        std::fs::remove_dir_all(&path)
+    } else {
+        std::fs::remove_file(&path)
+    };
+    match res {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, format!("remove: {}", e)).into_response(),
+    }
+}
+
+async fn volume_path_patch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vid): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<VolumePathQuery>,
+    _body: Bytes,
+) -> Response {
+    let vol = match volume_rec(&state, &vid) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = check_volume_auth(&state, &headers, &vol).await {
+        return e.into_response();
+    }
+    let path = volume_path(&vid, &q.path);
+    match entry_stat_json(&path, &q.path) {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, format!("not found: {}", e)).into_response(),
+    }
 }
 
 // ---- main ---------------------------------------------------------------
@@ -2326,6 +2876,20 @@ async fn main() -> Result<()> {
         // Volumes
         .route("/volumes", post(volumes_create).get(volumes_list))
         .route("/volumes/:vid", get(volume_get).delete(volume_delete))
+        .route(
+            "/volumecontent/:vid/file",
+            get(volume_file_get).put(volume_file_put),
+        )
+        .route(
+            "/volumecontent/:vid/dir",
+            get(volume_dir_get).post(volume_dir_post),
+        )
+        .route(
+            "/volumecontent/:vid/path",
+            get(volume_path_get)
+                .delete(volume_path_delete)
+                .patch(volume_path_patch),
+        )
         // Connect RPC paths (E2B SDK sends to {base_url}/process.Process/Start)
         .route("/process.Process/Start", post(process_start))
         .route("/process.Process/List", post(process_list))
@@ -2530,6 +3094,7 @@ mod tests {
             memory_mb: 1024,
             disk_size_mb: 4096,
             state: "running".into(),
+            volume_mounts: Vec::new(),
         };
         let json = serde_json::to_string(&rec).unwrap();
         // Field names are renamed to camelCase E2B-style.
@@ -2539,5 +3104,16 @@ mod tests {
         assert_eq!(back.sandbox_id, "i123");
         assert_eq!(back.cpu_count, 2);
         assert_eq!(back.state, "running");
+    }
+
+    #[test]
+    fn maps_e2b_base_template_to_tools_default() {
+        std::env::remove_var("E2B_SHIM_BASE_TEMPLATE");
+        assert_eq!(effective_template_id("base"), "tools-default");
+        assert_eq!(effective_template_id(""), "tools-default");
+        assert_eq!(
+            effective_template_id("tools-python-dev"),
+            "tools-python-dev"
+        );
     }
 }
