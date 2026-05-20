@@ -114,6 +114,49 @@ when the host environment doesn't support them.
 - **cgroup** — per-session cgroup v2 with memory.max / cpu.max /
   pids.max defaults.
 
+## Volumes
+
+The e2b-shim implements the E2B SDK's `Volumes` API. A volume is a named
+bytes-bag that survives across sandboxes; mounting one into a sandbox at
+create time copies its contents into the session's cwd, and writes inside
+the mount mirror back to the volume.
+
+Two backends:
+
+- **local** (default) — volume content lives in
+  `/var/lib/e2b-shim/volumes/<volume_id>/` on the shim host. Reads and
+  writes are local-disk.
+- **s3** — authoritative content lives in an S3/TOS prefix. Same SDK
+  surface; the only change is one extra field on `POST /volumes`:
+
+  ```jsonc
+  {
+    "name": "my-vol",
+    "backend": "s3",
+    "s3": {
+      "bucket": "mindbox-data",
+      "prefix": "agents/run-0521",      // optional
+      // endpoint/region/accessKey/secretKey optional;
+      // fall back to TOS_* env (see docs/configuration.md)
+    }
+  }
+  ```
+
+  Sandboxes mounting an S3 volume see the prefix's state at create time
+  (snapshot) and sandbox writes mirror back to the bucket. Consistency
+  contract: create-time snapshot for reads, eventual-consistency for
+  write-back. Two sandboxes sharing one prefix do NOT share a live view.
+
+  S3 credentials/endpoint resolve in this order: per-volume body →
+  `TOS_*` env. If neither layer has both AK/SK, `POST /volumes` returns
+  `400 s3_unconfigured`.
+
+  Deleting an S3 volume removes the registry record and the scratch
+  cache; it does NOT touch any object in the bucket.
+
+See [`openspec/changes/add-s3-volume-backend/proposal.md`] for the design
+rationale and [`docs/configuration.md`] for the env knobs.
+
 ## Workspace
 
 ```

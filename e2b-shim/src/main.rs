@@ -346,19 +346,20 @@ fn volume_mirror_for(rec: &SandboxRec, abs_path: &str) -> Option<(String, String
 
 /// Mirror a write that happened on session cwd back to its owning volume.
 /// Best-effort: failures here log but do not fail the originating write.
-fn mirror_write_to_volume(state: &AppState, rec: &SandboxRec, abs_path: &str, bytes: &[u8]) {
+async fn mirror_write_to_volume(state: &AppState, rec: &SandboxRec, abs_path: &str, bytes: &[u8]) {
     let Some((name, rel)) = volume_mirror_for(rec, abs_path) else {
         return;
     };
-    let vid = state
+    let vol_rec = state
         .volumes
         .iter()
         .find(|r| r.value().volume_id == name || r.value().name == name)
-        .map(|r| r.value().volume_id.clone());
-    let Some(vid) = vid else {
+        .map(|r| r.value().clone());
+    let Some(vol_rec) = vol_rec else {
         eprintln!("[mirror] volume {name} not found; dropping mirror write");
         return;
     };
+    let vid = vol_rec.volume_id.clone();
     let target = volume_path(&vid, &rel);
     if let Some(parent) = target.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -372,26 +373,49 @@ fn mirror_write_to_volume(state: &AppState, rec: &SandboxRec, abs_path: &str, by
             e
         );
     }
+    if let VolumeBackend::S3(cfg) = &vol_rec.backend {
+        if let Err((_, msg)) = s3_put_file(state, &vid, cfg, &rel, bytes).await {
+            eprintln!(
+                "[mirror] S3 put for volume {} path {} failed: {}",
+                vid, rel, msg
+            );
+        }
+    }
 }
 
 /// Mirror a delete on session cwd back to its owning volume. Best-effort.
-fn mirror_delete_from_volume(state: &AppState, rec: &SandboxRec, abs_path: &str) {
+async fn mirror_delete_from_volume(state: &AppState, rec: &SandboxRec, abs_path: &str) {
     let Some((name, rel)) = volume_mirror_for(rec, abs_path) else {
         return;
     };
-    let vid = state
+    let vol_rec = state
         .volumes
         .iter()
         .find(|r| r.value().volume_id == name || r.value().name == name)
-        .map(|r| r.value().volume_id.clone());
-    let Some(vid) = vid else {
+        .map(|r| r.value().clone());
+    let Some(vol_rec) = vol_rec else {
         return;
     };
+    let vid = vol_rec.volume_id.clone();
     let target = volume_path(&vid, &rel);
-    if target.is_dir() {
+    let was_dir = target.is_dir();
+    if was_dir {
         let _ = std::fs::remove_dir_all(&target);
     } else {
         let _ = std::fs::remove_file(&target);
+    }
+    if let VolumeBackend::S3(cfg) = &vol_rec.backend {
+        let res = if was_dir {
+            s3_delete_prefix(state, &vid, cfg, &rel).await
+        } else {
+            s3_delete_object(state, &vid, cfg, &rel).await
+        };
+        if let Err((_, msg)) = res {
+            eprintln!(
+                "[mirror] S3 delete for volume {} path {} failed: {}",
+                vid, rel, msg
+            );
+        }
     }
 }
 
@@ -424,16 +448,13 @@ async fn copy_volume_to_tools_session(
     volume_id: &str,
     mount_path: &str,
 ) -> Result<(), (StatusCode, String)> {
-    let src = volume_fs_dir(volume_id);
-    if !src.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!(
-                r#"{{"code":"not_found","message":"volume {} not found"}}"#,
-                volume_id
-            ),
-        ));
-    }
+    let rec = state.volumes.get(volume_id).map(|r| r.clone()).ok_or((
+        StatusCode::NOT_FOUND,
+        format!(
+            r#"{{"code":"not_found","message":"volume {} not found"}}"#,
+            volume_id
+        ),
+    ))?;
     let dst_rel = tools_relative_path(mount_path);
     let rm_cmd = format!(
         "rm -rf -- {} && mkdir -p -- {}",
@@ -441,7 +462,62 @@ async fn copy_volume_to_tools_session(
         shell_quote(&dst_rel)
     );
     run_tools_bash(state, sid, &rm_cmd, 30).await?;
-    copy_dir_to_tools(state, sid, &src, &dst_rel).await
+    match &rec.backend {
+        VolumeBackend::Local => {
+            let src = volume_fs_dir(volume_id);
+            if !src.exists() {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        r#"{{"code":"not_found","message":"volume {} not found"}}"#,
+                        volume_id
+                    ),
+                ));
+            }
+            copy_dir_to_tools(state, sid, &src, &dst_rel).await
+        }
+        VolumeBackend::S3(cfg) => copy_s3_to_tools(state, sid, volume_id, cfg, &dst_rel).await,
+    }
+}
+
+/// Walk the S3 prefix and pipe each object into the session cwd at
+/// `dst_rel`. Mirror each object into the scratch dir on the way so that
+/// subsequent local reads work.
+async fn copy_s3_to_tools(
+    state: &AppState,
+    sid: &str,
+    volume_id: &str,
+    cfg: &S3VolumeCfg,
+    dst_rel: &str,
+) -> Result<(), (StatusCode, String)> {
+    let entries = s3_list_prefix(state, volume_id, cfg, "").await?;
+    let scratch = volume_fs_dir(volume_id);
+    let _ = std::fs::create_dir_all(&scratch);
+    for ent in entries {
+        if ent.rel_key.is_empty() || ent.rel_key.ends_with('/') {
+            continue;
+        }
+        let bytes = s3_get_file(state, volume_id, cfg, &ent.rel_key).await?;
+        // mkdir for any parent of the relative key
+        let child_rel = format!("{}/{}", dst_rel.trim_end_matches('/'), ent.rel_key);
+        if let Some((parent, _)) = child_rel.rsplit_once('/') {
+            let mkdir_cmd = format!("mkdir -p -- {}", shell_quote(parent));
+            run_tools_bash(state, sid, &mkdir_cmd, 30).await?;
+        }
+        // populate scratch cache
+        let scratch_path = scratch.join(&ent.rel_key);
+        if let Some(parent) = scratch_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&scratch_path, &bytes) {
+            eprintln!(
+                "[volume {}] scratch cache write failed for {}: {}",
+                volume_id, ent.rel_key, e
+            );
+        }
+        write_tools_file(state, sid, &child_rel, bytes).await?;
+    }
+    Ok(())
 }
 
 async fn copy_dir_to_tools(
@@ -561,6 +637,7 @@ struct AppState {
     template_tags: DashMap<String, Vec<String>>, // template_name -> tags
     volumes: DashMap<String, VolumeRec>,         // volume_id -> rec
     snapshots: DashMap<String, SnapshotRec>,     // snapshot_id -> rec
+    s3_creds: Arc<S3CredsResolver>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,9 +651,40 @@ struct VolumeRec {
     size_mb: u32,
     #[serde(rename = "createdAt")]
     created_at: String,
+    #[serde(default = "VolumeBackend::default_local")]
+    backend: VolumeBackend,
 }
 fn default_vol_size() -> u32 {
     1024
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum VolumeBackend {
+    Local,
+    S3(S3VolumeCfg),
+}
+
+impl VolumeBackend {
+    fn default_local() -> Self {
+        VolumeBackend::Local
+    }
+    #[allow(dead_code)]
+    fn name(&self) -> &'static str {
+        match self {
+            VolumeBackend::Local => "local",
+            VolumeBackend::S3(_) => "s3",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct S3VolumeCfg {
+    bucket: String,
+    #[serde(default)]
+    prefix: String,
+    region: String,
+    endpoint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -644,6 +752,220 @@ fn tos_from_env() -> Option<TosConfig> {
         region,
         endpoint,
     })
+}
+
+// ---- S3 volume backend --------------------------------------------------
+
+/// In-memory credential store shared across S3 volumes. Per-volume creds
+/// override env fallbacks; lookups are keyed by `(bucket, endpoint, region)`
+/// so different volumes can target different buckets in one shim.
+#[derive(Debug, Default)]
+struct S3CredsResolver {
+    by_volume: DashMap<String, (String, String)>, // volume_id -> (ak, sk)
+}
+
+impl S3CredsResolver {
+    fn record(&self, volume_id: &str, ak: String, sk: String) {
+        self.by_volume.insert(volume_id.to_string(), (ak, sk));
+    }
+    fn lookup(&self, volume_id: &str) -> Option<(String, String)> {
+        if let Some(v) = self.by_volume.get(volume_id) {
+            return Some(v.value().clone());
+        }
+        let ak = std::env::var("TOS_ACCESS_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let sk = std::env::var("TOS_SECRET_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        Some((ak, sk))
+    }
+    fn forget(&self, volume_id: &str) {
+        self.by_volume.remove(volume_id);
+    }
+}
+
+/// Join `prefix` and `rel` into a canonical S3 key — no leading slash, no
+/// duplicate slashes, drops empty segments.
+fn s3_key(prefix: &str, rel: &str) -> String {
+    let p = prefix.trim_matches('/');
+    let r = rel.trim_matches('/');
+    if p.is_empty() {
+        r.to_string()
+    } else if r.is_empty() {
+        p.to_string()
+    } else {
+        format!("{}/{}", p, r)
+    }
+}
+
+/// Build a rust-s3 Bucket for an S3 volume, looking up creds via the
+/// resolver. Returns 400 s3_unconfigured if no creds resolve.
+fn s3_bucket_for(
+    state: &AppState,
+    volume_id: &str,
+    cfg: &S3VolumeCfg,
+) -> Result<Box<s3::Bucket>, (StatusCode, String)> {
+    let (ak, sk) = state.s3_creds.lookup(volume_id).ok_or((
+        StatusCode::BAD_REQUEST,
+        r#"{"code":"s3_unconfigured","message":"no S3 credentials available for this volume"}"#
+            .into(),
+    ))?;
+    let creds =
+        s3::creds::Credentials::new(Some(&ak), Some(&sk), None, None, None).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    r#"{{"code":"s3_unconfigured","message":"invalid S3 credentials: {}"}}"#,
+                    e
+                ),
+            )
+        })?;
+    let region = s3::Region::Custom {
+        region: cfg.region.clone(),
+        endpoint: cfg.endpoint.clone(),
+    };
+    s3::Bucket::new(&cfg.bucket, region, creds).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                r#"{{"code":"s3_unconfigured","message":"bucket setup failed: {}"}}"#,
+                e
+            ),
+        )
+    })
+}
+
+async fn s3_put_file(
+    state: &AppState,
+    volume_id: &str,
+    cfg: &S3VolumeCfg,
+    rel: &str,
+    bytes: &[u8],
+) -> Result<(), (StatusCode, String)> {
+    let bucket = s3_bucket_for(state, volume_id, cfg)?;
+    let key = s3_key(&cfg.prefix, rel);
+    let resp = bucket
+        .put_object(&key, bytes)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("s3 put_object: {}", e)))?;
+    if !(200..300).contains(&resp.status_code()) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("s3 put_object status={}", resp.status_code()),
+        ));
+    }
+    Ok(())
+}
+
+async fn s3_get_file(
+    state: &AppState,
+    volume_id: &str,
+    cfg: &S3VolumeCfg,
+    rel: &str,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    let bucket = s3_bucket_for(state, volume_id, cfg)?;
+    let key = s3_key(&cfg.prefix, rel);
+    let resp = bucket
+        .get_object(&key)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("s3 get_object: {}", e)))?;
+    let code = resp.status_code();
+    if code == 404 {
+        return Err((StatusCode::NOT_FOUND, "not found".into()));
+    }
+    if !(200..300).contains(&code) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("s3 get_object status={}", code),
+        ));
+    }
+    Ok(resp.bytes().to_vec())
+}
+
+async fn s3_delete_object(
+    state: &AppState,
+    volume_id: &str,
+    cfg: &S3VolumeCfg,
+    rel: &str,
+) -> Result<(), (StatusCode, String)> {
+    let bucket = s3_bucket_for(state, volume_id, cfg)?;
+    let key = s3_key(&cfg.prefix, rel);
+    let resp = bucket
+        .delete_object(&key)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("s3 delete_object: {}", e)))?;
+    let code = resp.status_code();
+    if code == 404 {
+        return Ok(()); // already gone
+    }
+    if !(200..300).contains(&code) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("s3 delete_object status={}", code),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct S3Entry {
+    /// Object key relative to the volume's `cfg.prefix`, with no leading `/`.
+    rel_key: String,
+    #[allow(dead_code)]
+    size: u64,
+    #[allow(dead_code)]
+    last_modified: String,
+}
+
+async fn s3_list_prefix(
+    state: &AppState,
+    volume_id: &str,
+    cfg: &S3VolumeCfg,
+    rel_prefix: &str,
+) -> Result<Vec<S3Entry>, (StatusCode, String)> {
+    let bucket = s3_bucket_for(state, volume_id, cfg)?;
+    // The list prefix is the full s3 key prefix; we strip cfg.prefix later
+    // so the caller sees volume-relative paths.
+    let full_prefix = s3_key(&cfg.prefix, rel_prefix);
+    let pages = bucket
+        .list(full_prefix.clone(), None)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("s3 list: {}", e)))?;
+    let strip = if cfg.prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", cfg.prefix.trim_matches('/'))
+    };
+    let mut out = Vec::new();
+    for page in pages {
+        for obj in page.contents {
+            let rel = if !strip.is_empty() && obj.key.starts_with(&strip) {
+                obj.key[strip.len()..].to_string()
+            } else {
+                obj.key.trim_start_matches('/').to_string()
+            };
+            out.push(S3Entry {
+                rel_key: rel,
+                size: obj.size,
+                last_modified: obj.last_modified,
+            });
+        }
+    }
+    Ok(out)
+}
+
+async fn s3_delete_prefix(
+    state: &AppState,
+    volume_id: &str,
+    cfg: &S3VolumeCfg,
+    rel_prefix: &str,
+) -> Result<(), (StatusCode, String)> {
+    let entries = s3_list_prefix(state, volume_id, cfg, rel_prefix).await?;
+    for ent in entries {
+        s3_delete_object(state, volume_id, cfg, &ent.rel_key).await?;
+    }
+    Ok(())
 }
 
 // ---- REST: POST /sandboxes ---------------------------------------------
@@ -1368,7 +1690,7 @@ async fn fs_remove(
     // Mirror delete back to any owning volume before we touch the host fs.
     if let Ok(sid) = pick_sandbox_id(&state, &headers) {
         if let Some(rec) = state.sandboxes.get(&sid) {
-            mirror_delete_from_volume(&state, &rec, &req.path);
+            mirror_delete_from_volume(&state, &rec, &req.path).await;
         }
     }
     let path = match resolve_path(&state, &headers, &req.path) {
@@ -1504,7 +1826,7 @@ async fn files_post(
                     // mount root, also mirror the write to the volume's
                     // host directory so the volume content stays in sync.
                     if let Some(rec) = state.sandboxes.get(&sid) {
-                        mirror_write_to_volume(&state, &rec, &q.path, &payload_for_tools);
+                        mirror_write_to_volume(&state, &rec, &q.path, &payload_for_tools).await;
                     }
                     let resp = serde_json::json!([{
                         "name": rel.rsplit('/').next().unwrap_or(""),
@@ -2552,12 +2874,118 @@ fn volumes_root() -> std::path::PathBuf {
     )
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Debug, Default)]
 struct CreateVolumeBody {
     #[serde(default)]
     name: Option<String>,
     #[serde(default, rename = "sizeMB")]
     size_mb: Option<u32>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    s3: Option<S3CreateBody>,
+}
+
+#[derive(serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct S3CreateBody {
+    #[serde(default)]
+    bucket: Option<String>,
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    access_key: Option<String>,
+    #[serde(default)]
+    secret_key: Option<String>,
+}
+
+type S3Creds = (String, String);
+
+/// Build the S3 volume config from the request body, falling back to env
+/// (`TOS_*` and `S3_VOLUME_DEFAULT_*`). Returns `400 s3_unconfigured` if the
+/// bucket can't be resolved.
+fn resolve_s3_cfg(
+    body: Option<&S3CreateBody>,
+    volume_id: &str,
+) -> Result<(S3VolumeCfg, Option<S3Creds>), (StatusCode, String)> {
+    let b = body.cloned().unwrap_or_default();
+    let bucket = b
+        .bucket
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("S3_VOLUME_DEFAULT_BUCKET").ok().filter(|s| !s.is_empty()))
+        .or_else(|| std::env::var("TOS_BUCKET").ok().filter(|s| !s.is_empty()))
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            r#"{"code":"s3_unconfigured","message":"no bucket: provide s3.bucket or set S3_VOLUME_DEFAULT_BUCKET / TOS_BUCKET"}"#
+                .into(),
+        ))?;
+    let region = b
+        .region
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("TOS_REGION").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "cn-beijing".into());
+    let endpoint = b
+        .endpoint
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("TOS_S3_ENDPOINT").ok().filter(|s| !s.is_empty()))
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            r#"{"code":"s3_unconfigured","message":"no endpoint: provide s3.endpoint or set TOS_S3_ENDPOINT"}"#
+                .into(),
+        ))?;
+    let prefix = b
+        .prefix
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("S3_VOLUME_DEFAULT_PREFIX")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .map(|p| p.trim_matches('/').to_string())
+        .map(|p| {
+            if p.is_empty() {
+                volume_id.to_string()
+            } else {
+                format!("{}/{}", p, volume_id)
+            }
+        })
+        .unwrap_or_else(|| volume_id.to_string());
+
+    // Credentials: per-volume body wins; otherwise we leave it to the
+    // resolver to find env at use-time. We still validate here so we can
+    // fail fast on `POST /volumes` rather than at first read.
+    let creds: Option<S3Creds> = match (b.access_key.clone(), b.secret_key.clone()) {
+        (Some(ak), Some(sk)) if !ak.is_empty() && !sk.is_empty() => Some((ak, sk)),
+        _ => None,
+    };
+    if creds.is_none() {
+        let env_ak = std::env::var("TOS_ACCESS_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let env_sk = std::env::var("TOS_SECRET_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if env_ak.is_none() || env_sk.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                r#"{"code":"s3_unconfigured","message":"no credentials: provide s3.accessKey/secretKey or set TOS_ACCESS_KEY/TOS_SECRET_KEY"}"#
+                    .into(),
+            ));
+        }
+    }
+    Ok((
+        S3VolumeCfg {
+            bucket,
+            prefix,
+            region,
+            endpoint,
+        },
+        creds,
+    ))
 }
 
 async fn volumes_create(
@@ -2567,13 +2995,38 @@ async fn volumes_create(
 ) -> Result<(StatusCode, Json<VolumeRec>), (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
     let vol_id = format!("vol{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ%f"));
-    let name = body.name.unwrap_or_else(|| vol_id.clone());
+    let name = body.name.clone().unwrap_or_else(|| vol_id.clone());
+    let backend_name = body
+        .backend
+        .as_deref()
+        .unwrap_or("local")
+        .to_ascii_lowercase();
+    let backend = match backend_name.as_str() {
+        "local" => VolumeBackend::Local,
+        "s3" => {
+            let (cfg, creds) = resolve_s3_cfg(body.s3.as_ref(), &vol_id)?;
+            if let Some((ak, sk)) = creds {
+                state.s3_creds.record(&vol_id, ak, sk);
+            }
+            VolumeBackend::S3(cfg)
+        }
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    r#"{{"code":"bad_request","message":"unknown backend: {}"}}"#,
+                    other
+                ),
+            ))
+        }
+    };
     let rec = VolumeRec {
         volume_id: vol_id.clone(),
         name,
         token: uuid::Uuid::new_v4().to_string(),
         size_mb: body.size_mb.unwrap_or(1024),
         created_at: chrono::Utc::now().to_rfc3339(),
+        backend,
     };
     std::fs::create_dir_all(volume_fs_dir(&vol_id)).map_err(|e| {
         (
@@ -2619,6 +3072,7 @@ async fn volume_delete(
 ) -> Result<StatusCode, (StatusCode, String)> {
     check_api_key(&state, &headers).await?;
     state.volumes.remove(&vid);
+    state.s3_creds.forget(&vid);
     let _ = std::fs::remove_dir_all(volume_fs_dir(&vid));
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2685,6 +3139,16 @@ async fn volume_file_put(
     if let Err(e) = std::fs::write(&path, &body) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {}", e)).into_response();
     }
+    // S3 backend: also push the bytes to the bucket. The scratch write
+    // above acts as a local cache for subsequent reads and so that
+    // entry_stat_json sees a real file. Failures here surface to the
+    // caller — unlike write-back from a running sandbox, this is a direct
+    // volume API call and the caller wants to know if the bucket put failed.
+    if let VolumeBackend::S3(cfg) = &vol.backend {
+        if let Err(e) = s3_put_file(&state, &vid, cfg, &q.path, &body).await {
+            return e.into_response();
+        }
+    }
     match entry_stat_json(&path, &q.path) {
         Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("stat: {}", e)).into_response(),
@@ -2703,6 +3167,30 @@ async fn volume_file_get(
     };
     if let Err(e) = check_volume_auth(&state, &headers, &vol).await {
         return e.into_response();
+    }
+    // S3 backend: always pull fresh from the bucket so concurrent writers
+    // (sandbox mirror-back, separate API clients) see a consistent view.
+    // Fall back to scratch only if S3 errors transiently.
+    if let VolumeBackend::S3(cfg) = &vol.backend {
+        match s3_get_file(&state, &vid, cfg, &q.path).await {
+            Ok(b) => {
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    b,
+                )
+                    .into_response();
+            }
+            Err((code, _)) if code == StatusCode::NOT_FOUND => {
+                return (code, "not found").into_response();
+            }
+            Err((_, msg)) => {
+                eprintln!(
+                    "[volume {}] S3 get failed, falling back to scratch: {}",
+                    vid, msg
+                );
+            }
+        }
     }
     let path = volume_path(&vid, &q.path);
     match std::fs::read(&path) {
@@ -2817,11 +3305,22 @@ async fn volume_path_delete(
         return e.into_response();
     }
     let path = volume_path(&vid, &q.path);
-    let res = if path.is_dir() {
+    let was_dir = path.is_dir();
+    let res = if was_dir {
         std::fs::remove_dir_all(&path)
     } else {
         std::fs::remove_file(&path)
     };
+    if let VolumeBackend::S3(cfg) = &vol.backend {
+        let s3_res = if was_dir {
+            s3_delete_prefix(&state, &vid, cfg, &q.path).await
+        } else {
+            s3_delete_object(&state, &vid, cfg, &q.path).await
+        };
+        if let Err((_, msg)) = s3_res {
+            eprintln!("[volume {}] S3 delete failed: {}", vid, msg);
+        }
+    }
     match res {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::NOT_FOUND, format!("remove: {}", e)).into_response(),
@@ -2896,6 +3395,7 @@ async fn main() -> Result<()> {
         template_tags: DashMap::new(),
         volumes: DashMap::new(),
         snapshots: DashMap::new(),
+        s3_creds: Arc::new(S3CredsResolver::default()),
     });
     for rec in prior {
         let sid = rec.sandbox_id.clone();
@@ -3293,5 +3793,199 @@ mod tests {
             volume_mirror_for(&rec, "/tmp/workspace/other.txt"),
             Some(("outer".into(), "other.txt".into()))
         );
+    }
+
+    // ---- S3 backend dispatch -------------------------------------------
+
+    /// Clear TOS_* env vars so a test isn't tainted by the caller's
+    /// environment. Returns previous values for restore.
+    fn clear_s3_env() -> Vec<(&'static str, Option<String>)> {
+        let keys = [
+            "TOS_ACCESS_KEY",
+            "TOS_SECRET_KEY",
+            "TOS_S3_ENDPOINT",
+            "TOS_REGION",
+            "TOS_BUCKET",
+            "S3_VOLUME_DEFAULT_BUCKET",
+            "S3_VOLUME_DEFAULT_PREFIX",
+        ];
+        let prev: Vec<_> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        prev
+    }
+
+    fn restore_env(prev: Vec<(&'static str, Option<String>)>) {
+        for (k, v) in prev {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn s3_key_canonicalization() {
+        assert_eq!(s3_key("p", "a/b"), "p/a/b");
+        assert_eq!(s3_key("p/", "a/b"), "p/a/b");
+        assert_eq!(s3_key("/p/", "/a/b/"), "p/a/b");
+        assert_eq!(s3_key("", "/x"), "x");
+        assert_eq!(s3_key("p", ""), "p");
+        assert_eq!(s3_key("", ""), "");
+    }
+
+    #[test]
+    fn create_volume_body_local_default() {
+        let body: CreateVolumeBody = serde_json::from_value(serde_json::json!({
+            "name": "v1"
+        }))
+        .unwrap();
+        assert!(body.backend.is_none());
+        assert!(body.s3.is_none());
+    }
+
+    #[test]
+    fn create_volume_body_parses_backend_s3() {
+        let body: CreateVolumeBody = serde_json::from_value(serde_json::json!({
+            "name": "v1",
+            "backend": "s3",
+            "s3": {
+                "bucket": "my-bucket",
+                "prefix": "agents/run-0521",
+                "region": "us-west-2",
+                "endpoint": "https://s3.us-west-2.amazonaws.com",
+                "accessKey": "AK",
+                "secretKey": "SK"
+            }
+        }))
+        .unwrap();
+        assert_eq!(body.backend.as_deref(), Some("s3"));
+        let s3 = body.s3.expect("s3");
+        assert_eq!(s3.bucket.as_deref(), Some("my-bucket"));
+        assert_eq!(s3.prefix.as_deref(), Some("agents/run-0521"));
+        assert_eq!(s3.region.as_deref(), Some("us-west-2"));
+        assert_eq!(s3.access_key.as_deref(), Some("AK"));
+        assert_eq!(s3.secret_key.as_deref(), Some("SK"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_s3_cfg_full_body() {
+        let prev = clear_s3_env();
+        let body = S3CreateBody {
+            bucket: Some("buk".into()),
+            prefix: Some("p1".into()),
+            region: Some("cn-beijing".into()),
+            endpoint: Some("https://example.com".into()),
+            access_key: Some("AK".into()),
+            secret_key: Some("SK".into()),
+        };
+        let (cfg, creds) = resolve_s3_cfg(Some(&body), "vol-123").unwrap();
+        assert_eq!(cfg.bucket, "buk");
+        // prefix is joined with the volume id so multiple volumes sharing
+        // an operator-default prefix don't collide.
+        assert_eq!(cfg.prefix, "p1/vol-123");
+        assert_eq!(cfg.region, "cn-beijing");
+        assert_eq!(cfg.endpoint, "https://example.com");
+        assert_eq!(creds, Some(("AK".into(), "SK".into())));
+        restore_env(prev);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_s3_cfg_env_fallback() {
+        let prev = clear_s3_env();
+        std::env::set_var("TOS_ACCESS_KEY", "envAK");
+        std::env::set_var("TOS_SECRET_KEY", "envSK");
+        std::env::set_var("TOS_S3_ENDPOINT", "https://tos.example.com");
+        std::env::set_var("TOS_BUCKET", "env-bucket");
+        let (cfg, creds) = resolve_s3_cfg(None, "vol-x").unwrap();
+        assert_eq!(cfg.bucket, "env-bucket");
+        assert_eq!(cfg.endpoint, "https://tos.example.com");
+        // No per-volume creds → resolver looks up env at use time, not stored.
+        assert!(creds.is_none());
+        restore_env(prev);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_s3_cfg_missing_bucket_rejected() {
+        let prev = clear_s3_env();
+        std::env::set_var("TOS_ACCESS_KEY", "envAK");
+        std::env::set_var("TOS_SECRET_KEY", "envSK");
+        std::env::set_var("TOS_S3_ENDPOINT", "https://tos.example.com");
+        // No bucket anywhere.
+        let err = resolve_s3_cfg(None, "vol-x").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("s3_unconfigured"), "got: {}", err.1);
+        restore_env(prev);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_s3_cfg_missing_creds_rejected() {
+        let prev = clear_s3_env();
+        // bucket via env, but no creds.
+        std::env::set_var("TOS_BUCKET", "buk");
+        std::env::set_var("TOS_S3_ENDPOINT", "https://tos.example.com");
+        let err = resolve_s3_cfg(None, "vol-x").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("s3_unconfigured"), "got: {}", err.1);
+        restore_env(prev);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_s3_cfg_missing_endpoint_rejected() {
+        let prev = clear_s3_env();
+        std::env::set_var("TOS_ACCESS_KEY", "envAK");
+        std::env::set_var("TOS_SECRET_KEY", "envSK");
+        std::env::set_var("TOS_BUCKET", "buk");
+        let err = resolve_s3_cfg(None, "vol-x").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("s3_unconfigured"), "got: {}", err.1);
+        restore_env(prev);
+    }
+
+    #[test]
+    fn volume_backend_name() {
+        assert_eq!(VolumeBackend::Local.name(), "local");
+        let cfg = S3VolumeCfg {
+            bucket: "b".into(),
+            prefix: "p".into(),
+            region: "r".into(),
+            endpoint: "e".into(),
+        };
+        assert_eq!(VolumeBackend::S3(cfg).name(), "s3");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn s3_creds_resolver_per_volume_overrides_env() {
+        let r = S3CredsResolver::default();
+        std::env::set_var("TOS_ACCESS_KEY", "envAK");
+        std::env::set_var("TOS_SECRET_KEY", "envSK");
+        // No per-volume entry → env wins.
+        assert_eq!(r.lookup("vol-a"), Some(("envAK".into(), "envSK".into())));
+        // Record per-volume creds → these win.
+        r.record("vol-a", "AK_A".into(), "SK_A".into());
+        assert_eq!(r.lookup("vol-a"), Some(("AK_A".into(), "SK_A".into())));
+        // Different volume still sees env.
+        assert_eq!(r.lookup("vol-b"), Some(("envAK".into(), "envSK".into())));
+        // forget removes per-volume entry.
+        r.forget("vol-a");
+        assert_eq!(r.lookup("vol-a"), Some(("envAK".into(), "envSK".into())));
+        std::env::remove_var("TOS_ACCESS_KEY");
+        std::env::remove_var("TOS_SECRET_KEY");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn s3_creds_resolver_returns_none_when_env_empty() {
+        let r = S3CredsResolver::default();
+        std::env::remove_var("TOS_ACCESS_KEY");
+        std::env::remove_var("TOS_SECRET_KEY");
+        assert_eq!(r.lookup("vol-x"), None);
     }
 }

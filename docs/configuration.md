@@ -74,15 +74,40 @@ The 8th-tool design is detailed in `openspec/specs/tools-process-tool/spec.md`.
 
 ## TOS / S3 object storage
 
-Used by the e2b-shim's snapshot endpoint and `scripts/backup-image-to-tos.sh`.
+Used by three features:
+- e2b-shim sandbox snapshot endpoint (`POST /sandboxes/:id/snapshot`).
+- `scripts/backup-image-to-tos.sh` backup tarball uploader.
+- S3-backed volumes — same envs serve as the credential fallback when a
+  `POST /volumes` body sets `backend: "s3"` without per-volume creds.
 
 | Env | Default | What it does |
 |---|---|---|
-| `TOS_BUCKET` | unset (feature disabled when empty) | Bucket name for sandbox snapshots and backup tarballs. |
-| `TOS_S3_ENDPOINT` | `https://tos-s3-cn-beijing.ivolces.com` | S3-compatible endpoint URL. |
+| `TOS_BUCKET` | unset (feature disabled when empty) | Bucket name for sandbox snapshots, backup tarballs, **and** the default bucket for S3 volumes when neither the volume body nor `S3_VOLUME_DEFAULT_BUCKET` sets one. |
+| `TOS_S3_ENDPOINT` | unset | S3-compatible endpoint URL. Required for S3 volumes if the body doesn't specify `s3.endpoint`. |
 | `TOS_REGION` | `cn-beijing` | Region for the S3 client. |
-| `TOS_ACCESS_KEY` | unset | Access key for the S3 client. |
-| `TOS_SECRET_KEY` | unset | Secret key. |
+| `TOS_ACCESS_KEY` | unset | Access key. Required for S3 volumes when no per-volume `s3.accessKey` is supplied. |
+| `TOS_SECRET_KEY` | unset | Secret key. Same fallback semantics as `TOS_ACCESS_KEY`. |
+
+## S3 volume backend
+
+Additional knobs for the S3 volume backend (independent of snapshot/backup):
+
+| Env | Default | What it does |
+|---|---|---|
+| `S3_VOLUME_DEFAULT_BUCKET` | unset | Operator default bucket used when `POST /volumes` body has `backend: "s3"` but no `s3.bucket`. Overrides `TOS_BUCKET` for volumes. |
+| `S3_VOLUME_DEFAULT_PREFIX` | unset | Operator default prefix. The resulting volume's S3 prefix becomes `<S3_VOLUME_DEFAULT_PREFIX>/<volume_id>` so multiple volumes don't collide. When unset, the volume prefix defaults to just the `volume_id`. |
+
+S3 volume credential resolution chain (per-request, evaluated at
+`POST /volumes` time):
+
+1. Per-volume body: `s3.accessKey` + `s3.secretKey`.
+2. Env: `TOS_ACCESS_KEY` + `TOS_SECRET_KEY`.
+
+If neither layer resolves both credentials, `POST /volumes` returns
+`400 { code: "s3_unconfigured" }` and creates no volume record.
+
+See [`../openspec/changes/add-s3-volume-backend/proposal.md`] for the full
+contract (consistency model, write-back semantics, deletion behavior).
 
 ## template-builder CLI
 
