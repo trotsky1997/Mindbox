@@ -184,7 +184,7 @@ pub(crate) fn cgroup_attach_pid(cgroup_dir: &std::path::Path, pid: u32) {
 /// Best-effort cgroup teardown. Kills any remaining processes (kill_pids)
 /// then rmdirs. Failure is silent (process might already be gone, kernel
 /// keeps the empty cgroup until last ref drops).
-fn cleanup_session_cgroup(cgroup_dir: &std::path::Path) {
+pub(crate) fn cleanup_session_cgroup(cgroup_dir: &std::path::Path) {
     let _ = std::fs::write(
         cgroup_dir.join("cgroup.kill"),
         b"1
@@ -783,6 +783,10 @@ async fn delete_session(
     let Some((_, session)) = state.sessions.remove(&id) else {
         return Err((StatusCode::NOT_FOUND, format!("session {id} not found")));
     };
+    // Reap every process this session spawned before we drop the cwd or
+    // cgroup. Safe to call when the session never used the process tool;
+    // it just walks an empty map.
+    process::reap_session_processes(&session, state.process_cfg.kill_group).await;
     let _ = tokio::fs::remove_dir_all(&session.cwd).await; // best-effort cleanup
     if let Some(root) = state.isolation.cgroup_root.as_ref() {
         cleanup_session_cgroup(&root.join(format!("mindbox-{}", id)));
@@ -1339,6 +1343,11 @@ async fn main() -> anyhow::Result<()> {
     let state = make_state()?;
     let app = build_router(state.clone());
 
+    // Periodically evict sessions whose last tool-call timestamp is older
+    // than TOOLS_SESSION_IDLE_REAP_SEC. Required so abandoned sessions —
+    // and the processes they own — do not survive forever.
+    process::spawn_idle_reaper(state.clone());
+
     let port = std::env::var("TOOLS_PORT")
         .unwrap_or_else(|_| "8002".into())
         .parse::<u16>()?;
@@ -1347,7 +1356,17 @@ async fn main() -> anyhow::Result<()> {
         "tools-rust listening on 0.0.0.0:{port}, sandbox_root={}",
         state.sandbox_root.display()
     );
-    axum::serve(listener, app).await?;
+    let shutdown_state = state.clone();
+    let shutdown_signal = async move {
+        // Wait for either SIGINT or SIGTERM, then drain all sessions so
+        // children don't outlive the daemon.
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("[tools-rust] shutdown signal received; draining sessions");
+        process::drain_all_sessions(&shutdown_state).await;
+    };
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
     Ok(())
 }
 

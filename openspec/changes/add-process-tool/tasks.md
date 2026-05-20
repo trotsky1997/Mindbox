@@ -20,18 +20,18 @@
 ## 4. Action handlers
 
 - [x] 4.1 Implement `start`: spawn through `build_sandboxed_command`, set `setsid()` in `pre_exec`, attach the per-session cgroup, spin up stdout/stderr drain tasks and a wait task, populate the handle, return `{process_id, running:true}`
-- [ ] 4.2 Implement `write`: lock stdin, write `input` (utf-8 or base64), honor `eof:true` by dropping the stdin handle; tolerate already-exited child by returning `{running:false, exit_code}`
+- [x] 4.2 Implement `write`: lock stdin, write `input` (utf-8 or base64), honor `eof:true` by dropping the stdin handle; tolerate already-exited child by returning `{running:false, exit_code}`
 - [x] 4.3 Implement `read`: pop from stdout+stderr ring buffers, advance cursors, honor `max_bytes`, populate `eof_*` after wait task closes the writer side, support short-blocking via `tokio::time::timeout(notify.notified(), min(timeout_sec, 60s))`
-- [ ] 4.4 Implement `signal`: parse name → `libc::c_int`, send via `kill(-pgid, sig)` when `TOOLS_PROCESS_KILL_GROUP=1` else `kill(pid, sig)`, treat ESRCH on exited child as success
+- [x] 4.4 Implement `signal`: parse name → `libc::c_int`, send via `kill(-pgid, sig)` when `TOOLS_PROCESS_KILL_GROUP=1` else `kill(pid, sig)`, treat ESRCH on exited child as success
 - [x] 4.5 Implement `wait`: park on `wait_notify` until terminal state or `timeout_sec` (default 300s), return appropriate fields; non-zero exit code stays a successful response
-- [ ] 4.6 Implement `stop`: send graceful signal (`SIGTERM`), wait for grace, escalate to `SIGKILL`, return final state; respect kill-group setting
+- [x] 4.6 Implement `stop`: send graceful signal (`SIGTERM`), wait for grace, escalate to `SIGKILL`, return final state; respect kill-group setting
 - [x] 4.7 Implement `list`: snapshot the session's process map, return `ProcessSummary[]` (id, command, started_at, running, exit_code if any)
 
 ## 5. Lifecycle integration
 
-- [ ] 5.1 Extend `delete_session` to terminate every `ProcessHandle` for the session (SIGTERM → grace → SIGKILL) and drop them from the session map before cwd/cgroup cleanup
-- [ ] 5.2 Add a graceful shutdown handler (`tokio::signal::ctrl_c` + SIGTERM) that drains all sessions like `delete_session` then exits the daemon cleanly
-- [ ] 5.3 Add a background idle-session reaper task that uses `last_touched` (updated on every tool call) plus `TOOLS_SESSION_IDLE_REAP_SEC` to evict stale sessions, running the same cleanup as `delete_session`
+- [x] 5.1 Extend `delete_session` to terminate every `ProcessHandle` for the session (SIGTERM → grace → SIGKILL) and drop them from the session map before cwd/cgroup cleanup
+- [x] 5.2 Add a graceful shutdown handler (`tokio::signal::ctrl_c` + SIGTERM) that drains all sessions like `delete_session` then exits the daemon cleanly
+- [x] 5.3 Add a background idle-session reaper task that uses `last_touched` (updated on every tool call) plus `TOOLS_SESSION_IDLE_REAP_SEC` to evict stale sessions, running the same cleanup as `delete_session`
 
 ## 6. Unsupported-backend probe
 

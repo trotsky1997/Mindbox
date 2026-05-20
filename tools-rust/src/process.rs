@@ -306,12 +306,10 @@ pub async fn tool_process(
         ProcessAction::Start => action_start(&state, &sid, session, req).await,
         ProcessAction::Read => action_read(session, req).await,
         ProcessAction::Wait => action_wait(session, req).await,
+        ProcessAction::Write => action_write(session, req).await,
+        ProcessAction::Signal => action_signal(&state, session, req).await,
+        ProcessAction::Stop => action_stop(&state, session, req).await,
         ProcessAction::List => Ok(Json(action_list(session))),
-        // Other actions (write/signal/stop) land in batch 3.
-        ProcessAction::Write | ProcessAction::Signal | ProcessAction::Stop => Err((
-            StatusCode::NOT_IMPLEMENTED,
-            r#"{"code":"action_not_yet_implemented"}"#.into(),
-        )),
     }
 }
 
@@ -658,6 +656,301 @@ fn action_list(session: Arc<crate::SessionState>) -> ProcessResult {
 // Public registry types reused by SessionState
 
 pub type SessionProcessMap = DashMap<String, Arc<ProcessHandle>>;
+
+// ---------------------------------------------------------------------------
+// Batch 3: write / signal / stop + lifecycle helpers
+
+use tokio::io::AsyncWriteExt;
+
+const STOP_GRACE_SEC: f64 = 5.0;
+
+async fn action_write(
+    session: Arc<crate::SessionState>,
+    req: ProcessReq,
+) -> Result<Json<ProcessResult>, (StatusCode, String)> {
+    let process_id = req.process_id.as_deref().ok_or((
+        StatusCode::BAD_REQUEST,
+        "write requires process_id".to_string(),
+    ))?;
+    let handle = session
+        .processes
+        .get(process_id)
+        .ok_or((StatusCode::NOT_FOUND, "process not found".to_string()))?
+        .clone();
+
+    // Decode input bytes per encoding.
+    let bytes: Vec<u8> =
+        match (req.encoding, req.input.as_deref()) {
+            (_, None) => Vec::new(),
+            (ProcessEncoding::Utf8, Some(s)) => s.as_bytes().to_vec(),
+            (ProcessEncoding::Base64, Some(s)) => base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("base64 decode: {e}")))?,
+        };
+
+    // Tolerate already-exited child: return a successful describe-state response.
+    let (running, exit_code) = process_running_and_code(&handle).await;
+    if !running {
+        return Ok(Json(ProcessResult {
+            process_id: Some(process_id.to_string()),
+            running: Some(false),
+            exit_code,
+            ..Default::default()
+        }));
+    }
+
+    let mut stdin_slot = handle.stdin.lock().await;
+    let mut stdin = stdin_slot
+        .take()
+        .ok_or((StatusCode::BAD_REQUEST, "stdin already closed".to_string()))?;
+
+    if !bytes.is_empty() {
+        if let Err(e) = stdin.write_all(&bytes).await {
+            // Put it back so future writes can still report status.
+            *stdin_slot = Some(stdin);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write stdin: {e}"),
+            ));
+        }
+        let _ = stdin.flush().await;
+    }
+
+    if req.eof {
+        // Drop the stdin half — child sees EOF.
+        drop(stdin);
+        // Leave the slot None so subsequent writes get 400.
+    } else {
+        *stdin_slot = Some(stdin);
+    }
+
+    Ok(Json(ProcessResult {
+        process_id: Some(process_id.to_string()),
+        running: Some(true),
+        ..Default::default()
+    }))
+}
+
+/// Parse a POSIX signal name like "SIGTERM" or just "TERM" / "9".
+fn parse_signal(name: &str) -> Option<i32> {
+    let s = name.trim();
+    if let Ok(n) = s.parse::<i32>() {
+        return Some(n);
+    }
+    let upper = s.to_uppercase();
+    let stripped = upper.strip_prefix("SIG").unwrap_or(&upper);
+    Some(match stripped {
+        "HUP" => libc::SIGHUP,
+        "INT" => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "ILL" => libc::SIGILL,
+        "ABRT" => libc::SIGABRT,
+        "FPE" => libc::SIGFPE,
+        "KILL" => libc::SIGKILL,
+        "USR1" => libc::SIGUSR1,
+        "SEGV" => libc::SIGSEGV,
+        "USR2" => libc::SIGUSR2,
+        "PIPE" => libc::SIGPIPE,
+        "ALRM" => libc::SIGALRM,
+        "TERM" => libc::SIGTERM,
+        "CHLD" => libc::SIGCHLD,
+        "CONT" => libc::SIGCONT,
+        "STOP" => libc::SIGSTOP,
+        "TSTP" => libc::SIGTSTP,
+        "WINCH" => libc::SIGWINCH,
+        _ => return None,
+    })
+}
+
+/// Deliver `sig` to the child. Targets the process group when `kill_group`,
+/// otherwise the pid directly. ESRCH (already exited) is reported back as
+/// non-fatal so the caller can observe state.
+fn send_signal_to(pid: u32, sig: i32, kill_group: bool) -> std::io::Result<()> {
+    let target = if kill_group {
+        -(pid as i32)
+    } else {
+        pid as i32
+    };
+    // SAFETY: kill(2) is async-signal-safe; we pass a valid signal number.
+    let rc = unsafe { libc::kill(target, sig) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    // ESRCH = no such process; child already exited.
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err)
+}
+
+async fn action_signal(
+    state: &Arc<AppState>,
+    session: Arc<crate::SessionState>,
+    req: ProcessReq,
+) -> Result<Json<ProcessResult>, (StatusCode, String)> {
+    let process_id = req.process_id.as_deref().ok_or((
+        StatusCode::BAD_REQUEST,
+        "signal requires process_id".to_string(),
+    ))?;
+    let signal_name = req.signal.as_deref().ok_or((
+        StatusCode::BAD_REQUEST,
+        "signal requires signal name".to_string(),
+    ))?;
+    let sig = parse_signal(signal_name).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("unknown signal: {signal_name}"),
+    ))?;
+    let handle = session
+        .processes
+        .get(process_id)
+        .ok_or((StatusCode::NOT_FOUND, "process not found".to_string()))?
+        .clone();
+
+    send_signal_to(handle.pid, sig, state.process_cfg.kill_group)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("kill: {e}")))?;
+
+    let (running, exit_code) = process_running_and_code(&handle).await;
+    let signal_num = if !running && exit_code.is_none() {
+        let g = handle.state.lock().await;
+        match *g {
+            ProcessState::Terminated { signal } => Some(signal),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(Json(ProcessResult {
+        process_id: Some(process_id.to_string()),
+        running: Some(running),
+        exit_code,
+        signal: signal_num,
+        ..Default::default()
+    }))
+}
+
+async fn action_stop(
+    state: &Arc<AppState>,
+    session: Arc<crate::SessionState>,
+    req: ProcessReq,
+) -> Result<Json<ProcessResult>, (StatusCode, String)> {
+    let process_id = req.process_id.as_deref().ok_or((
+        StatusCode::BAD_REQUEST,
+        "stop requires process_id".to_string(),
+    ))?;
+    let handle = session
+        .processes
+        .get(process_id)
+        .ok_or((StatusCode::NOT_FOUND, "process not found".to_string()))?
+        .clone();
+
+    let grace = req.timeout_sec.unwrap_or(STOP_GRACE_SEC).clamp(0.0, 60.0);
+
+    terminate_handle(&handle, grace, state.process_cfg.kill_group).await;
+
+    let (running, exit_code) = process_running_and_code(&handle).await;
+    let signal_num = if !running && exit_code.is_none() {
+        let g = handle.state.lock().await;
+        match *g {
+            ProcessState::Terminated { signal } => Some(signal),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(Json(ProcessResult {
+        process_id: Some(process_id.to_string()),
+        running: Some(running),
+        exit_code,
+        signal: signal_num,
+        ..Default::default()
+    }))
+}
+
+/// Terminate a process: SIGTERM, wait up to `grace` seconds for it to
+/// observe its terminal state via the wait task, then SIGKILL if still
+/// running. Safe to call on already-exited processes (best-effort).
+pub(crate) async fn terminate_handle(handle: &Arc<ProcessHandle>, grace: f64, kill_group: bool) {
+    if !handle.snapshot_running() {
+        return;
+    }
+    let _ = send_signal_to(handle.pid, libc::SIGTERM, kill_group);
+    if grace > 0.0 {
+        let dur = Duration::from_millis((grace * 1000.0) as u64);
+        let _ = tokio::time::timeout(dur, handle.wait_notify.notified()).await;
+    }
+    if handle.snapshot_running() {
+        let _ = send_signal_to(handle.pid, libc::SIGKILL, kill_group);
+        // give the wait task a brief window to observe termination
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle.wait_notify.notified()).await;
+    }
+}
+
+/// Terminate every process owned by `session`. Used by `delete_session`,
+/// the daemon graceful shutdown handler, and the idle reaper.
+pub(crate) async fn reap_session_processes(session: &crate::SessionState, kill_group: bool) {
+    let handles: Vec<Arc<ProcessHandle>> = session
+        .processes
+        .iter()
+        .map(|e| e.value().clone())
+        .collect();
+    for h in handles {
+        terminate_handle(&h, STOP_GRACE_SEC, kill_group).await;
+    }
+    session.processes.clear();
+}
+
+/// Background task that periodically evicts sessions whose last_touched
+/// timestamp is older than `idle_reap_sec`. Runs every
+/// `max(idle_reap_sec / 4, 1)` seconds, capped to 60s.
+pub(crate) fn spawn_idle_reaper(state: Arc<AppState>) {
+    let idle_sec = state.process_cfg.idle_reap_sec;
+    let kill_group = state.process_cfg.kill_group;
+    if idle_sec == 0 {
+        return;
+    }
+    let tick = (idle_sec / 4).clamp(1, 60);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(tick));
+        // skip the immediate-tick fire
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            let mut victims: Vec<String> = Vec::new();
+            for entry in state.sessions.iter() {
+                let last = *entry.value().last_touched.lock().unwrap();
+                if now.saturating_duration_since(last).as_secs() >= idle_sec {
+                    victims.push(entry.key().clone());
+                }
+            }
+            for sid in victims {
+                if let Some((_, session)) = state.sessions.remove(&sid) {
+                    reap_session_processes(&session, kill_group).await;
+                    let _ = tokio::fs::remove_dir_all(&session.cwd).await;
+                    if let Some(root) = state.isolation.cgroup_root.as_ref() {
+                        crate::cleanup_session_cgroup(&root.join(format!("mindbox-{}", sid)));
+                    }
+                    tracing::info!("[reaper] evicted idle session {}", sid);
+                }
+            }
+        }
+    });
+}
+
+/// Graceful shutdown: stop accepting new HTTP requests (caller's job) then
+/// drain every session like delete_session does. Returns once every child
+/// has reached a terminal state or grace timeouts have elapsed.
+pub(crate) async fn drain_all_sessions(state: &Arc<AppState>) {
+    let sids: Vec<String> = state.sessions.iter().map(|e| e.key().clone()).collect();
+    for sid in sids {
+        if let Some((_, session)) = state.sessions.remove(&sid) {
+            reap_session_processes(&session, state.process_cfg.kill_group).await;
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 
@@ -1038,5 +1331,285 @@ mod tests {
         .unwrap();
         assert_eq!(r.action, ProcessAction::Read);
         assert_eq!(r.encoding, ProcessEncoding::Base64);
+    }
+
+    #[test]
+    fn parse_signal_understands_common_names() {
+        assert_eq!(parse_signal("SIGTERM"), Some(libc::SIGTERM));
+        assert_eq!(parse_signal("TERM"), Some(libc::SIGTERM));
+        assert_eq!(parse_signal("sigkill"), Some(libc::SIGKILL));
+        assert_eq!(parse_signal("9"), Some(9));
+        assert_eq!(parse_signal("NOPE"), None);
+    }
+
+    // helper: start a /bin/sh -c <cmd>
+    async fn start_sh(state: &Arc<AppState>, sid: &str, sh: &str) -> String {
+        let mut r = req(ProcessAction::Start);
+        r.command = Some("/bin/sh".into());
+        r.args = Some(vec!["-c".into(), sh.into()]);
+        tool_process(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(sid.into()),
+            axum::Json(r),
+        )
+        .await
+        .unwrap()
+        .0
+        .process_id
+        .unwrap()
+    }
+
+    async fn wait_pid(state: &Arc<AppState>, sid: &str, pid: &str, t: f64) -> ProcessResult {
+        let mut r = req(ProcessAction::Wait);
+        r.process_id = Some(pid.into());
+        r.timeout_sec = Some(t);
+        tool_process(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(sid.into()),
+            axum::Json(r),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    // 7.7 write with eof closes stdin; cat echoes input then exits 0.
+    // After the child has exited, write returns running:false (describe state),
+    // not 4xx. Writing to a *still-running* process whose stdin we closed
+    // returns 400.
+    #[tokio::test]
+    async fn write_with_eof_closes_stdin() {
+        let (_td, state) = tmp_state(true, false);
+        make_session(&state, "s").await;
+        let pid = start_sh(&state, "s", "cat").await;
+
+        let mut w = req(ProcessAction::Write);
+        w.process_id = Some(pid.clone());
+        w.input = Some("hello\n".into());
+        w.eof = true;
+        let resp = tool_process(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("s".into()),
+            axum::Json(w),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.0.running, Some(true));
+
+        let exit = wait_pid(&state, "s", &pid, 3.0).await;
+        assert_eq!(exit.running, Some(false));
+        assert_eq!(exit.exit_code, Some(0));
+    }
+
+    // EOF on a still-running child closes stdin; second write 400s.
+    #[tokio::test]
+    async fn second_write_after_eof_is_400_while_running() {
+        let (_td, state) = tmp_state(true, false);
+        make_session(&state, "s").await;
+        // Stay running even after stdin EOF
+        let pid = start_sh(&state, "s", "cat >/dev/null; sleep 30").await;
+
+        let mut w = req(ProcessAction::Write);
+        w.process_id = Some(pid.clone());
+        w.input = Some("hi".into());
+        w.eof = true;
+        let _ = tool_process(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("s".into()),
+            axum::Json(w),
+        )
+        .await
+        .unwrap();
+        // Let child reach the sleep branch
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut w2 = req(ProcessAction::Write);
+        w2.process_id = Some(pid.clone());
+        w2.input = Some("more".into());
+        let err = tool_process(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("s".into()),
+            axum::Json(w2),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // Cleanup
+        let mut stop_r = req(ProcessAction::Stop);
+        stop_r.process_id = Some(pid);
+        stop_r.timeout_sec = Some(0.5);
+        let _ = tool_process(
+            axum::extract::State(state),
+            axum::extract::Path("s".into()),
+            axum::Json(stop_r),
+        )
+        .await
+        .unwrap();
+    }
+
+    // 7.8 base64 round-trip: cat back what we sent
+    #[tokio::test]
+    async fn write_read_base64_round_trip() {
+        use base64::Engine as _;
+        let (_td, state) = tmp_state(true, false);
+        make_session(&state, "s").await;
+        let pid = start_sh(&state, "s", "cat").await;
+
+        // Send base64-encoded bytes (with a NUL to exercise non-UTF8)
+        let raw: &[u8] = b"hi\x00world";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        let mut w = req(ProcessAction::Write);
+        w.process_id = Some(pid.clone());
+        w.input = Some(encoded);
+        w.encoding = ProcessEncoding::Base64;
+        w.eof = true;
+        let _ = tool_process(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("s".into()),
+            axum::Json(w),
+        )
+        .await
+        .unwrap();
+        let _ = wait_pid(&state, "s", &pid, 3.0).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut r = req(ProcessAction::Read);
+        r.process_id = Some(pid);
+        r.encoding = ProcessEncoding::Base64;
+        let resp = tool_process(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("s".into()),
+            axum::Json(r),
+        )
+        .await
+        .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(resp.0.stdout.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(decoded, raw);
+    }
+
+    // 7.9 signal SIGTERM against a graceful child → exits with signal info
+    #[tokio::test]
+    async fn signal_sigterm_terminates() {
+        let (_td, state) = tmp_state(true, false);
+        make_session(&state, "s").await;
+        // sleep is graceful for SIGTERM (default action: terminate)
+        let pid = start_sh(&state, "s", "sleep 5").await;
+
+        let mut sig = req(ProcessAction::Signal);
+        sig.process_id = Some(pid.clone());
+        sig.signal = Some("SIGTERM".into());
+        let _ = tool_process(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("s".into()),
+            axum::Json(sig),
+        )
+        .await
+        .unwrap();
+
+        let exit = wait_pid(&state, "s", &pid, 3.0).await;
+        assert_eq!(exit.running, Some(false));
+        // sleep terminated by SIGTERM: no exit code, signal == 15
+        assert!(exit.exit_code.is_none());
+        assert_eq!(exit.signal, Some(libc::SIGTERM));
+    }
+
+    // 7.10 stop escalates to SIGKILL when child traps SIGTERM
+    #[tokio::test]
+    async fn stop_escalates_to_sigkill() {
+        let (_td, state) = tmp_state(true, false);
+        make_session(&state, "s").await;
+        // trap '' TERM disables SIGTERM; only SIGKILL can stop it
+        let pid = start_sh(&state, "s", "trap '' TERM; while :; do sleep 0.05; done").await;
+
+        let mut s = req(ProcessAction::Stop);
+        s.process_id = Some(pid.clone());
+        s.timeout_sec = Some(0.4);
+        let resp = tool_process(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("s".into()),
+            axum::Json(s),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.0.running, Some(false));
+        assert_eq!(resp.0.signal, Some(libc::SIGKILL));
+    }
+
+    // 7.11 signal against an exited process is a successful no-op
+    #[tokio::test]
+    async fn signal_on_exited_is_ok() {
+        let (_td, state) = tmp_state(true, false);
+        make_session(&state, "s").await;
+        let pid = start_sh(&state, "s", "true").await;
+        let _ = wait_pid(&state, "s", &pid, 3.0).await;
+
+        let mut sig = req(ProcessAction::Signal);
+        sig.process_id = Some(pid.clone());
+        sig.signal = Some("SIGTERM".into());
+        let resp = tool_process(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("s".into()),
+            axum::Json(sig),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.0.running, Some(false));
+        assert_eq!(resp.0.exit_code, Some(0));
+    }
+
+    // 7.15 delete_session reaps every owned process
+    #[tokio::test]
+    async fn reap_session_processes_kills_all_children() {
+        let (_td, state) = tmp_state(true, false);
+        let sess = make_session(&state, "s").await;
+        let mut pids = Vec::new();
+        for _ in 0..3 {
+            pids.push(start_sh(&state, "s", "sleep 30").await);
+        }
+        reap_session_processes(&sess, false).await;
+        assert!(sess.processes.is_empty());
+        // every child should be terminated; OS check via kill(pid, 0) → ESRCH
+        for pid_str in &pids {
+            let h = sess.processes.get(pid_str);
+            assert!(h.is_none());
+        }
+    }
+
+    // 7.16 cross-session reuse: pid from session A passed to session B → 404
+    #[tokio::test]
+    async fn cross_session_pid_returns_404() {
+        let (_td, state) = tmp_state(true, false);
+        make_session(&state, "a").await;
+        make_session(&state, "b").await;
+        let pid_a = start_sh(&state, "a", "sleep 5").await;
+
+        let mut r = req(ProcessAction::Read);
+        r.process_id = Some(pid_a);
+        let err = tool_process(
+            axum::extract::State(state),
+            axum::extract::Path("b".into()),
+            axum::Json(r),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    // 7.2 write without process_id → 400
+    #[tokio::test]
+    async fn write_without_pid_400() {
+        let (_td, state) = tmp_state(true, false);
+        make_session(&state, "s").await;
+        let err = tool_process(
+            axum::extract::State(state),
+            axum::extract::Path("s".into()),
+            axum::Json(req(ProcessAction::Write)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }
