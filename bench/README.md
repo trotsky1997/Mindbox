@@ -11,8 +11,17 @@ runs `matmul.py` to compare a cold daemon against a daemon that the bench has
 already warmed via the same commands `api-rust` would issue for `[warmup]`.
 
 ```bash
-# Build the template image once (uses the mindbox controller image, which ships
-# `template-build` inside it).
+# Easiest: start the released mindbox image once with a docker socket. The
+# entrypoint pulls / builds every configured template, so the bench's expected
+# `inspect-tpl-tools-tools-python-dev:latest` tag is present locally afterwards.
+docker run --rm -d --name mindbox-bench-bootstrap \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e MINDBOX_MODE=api \
+  ghcr.io/trotsky1997/mindbox:latest
+docker logs -f mindbox-bench-bootstrap | grep -m1 templates
+docker rm -f mindbox-bench-bootstrap
+
+# Or build the template image directly from the controller image:
 docker run --rm \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$PWD/templates:/opt/inspect-api/templates:ro" \

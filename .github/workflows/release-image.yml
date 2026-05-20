@@ -24,12 +24,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute lowercase image base
+        id: img
+        run: |
+          echo "base=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       # ---------------- mindbox controller image ----------------
       - name: mindbox image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.img.outputs.base }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=,format=short
@@ -46,17 +51,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ---------------- tools template image(s) ----------------
-      # template-builder ships inside the mindbox image, so we pull the
-      # just-pushed mindbox image back, run it with its templates dir
-      # bind-mounted, and let template-build emit the template image to
-      # the host docker daemon. Then re-tag for ghcr and push.
-
-      - name: Compute lowercase image base
-        id: img
-        run: |
-          echo "base=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
+      # ---------------- per-template tools images ----------------
+      # Templates are published alongside mindbox so that the controller can
+      # `docker pull` them at runtime via MINDBOX_TEMPLATE_REGISTRY. Operators
+      # that want a single-pull deployment only need ghcr.io/.../mindbox;
+      # template-build inside the controller image is the offline fallback.
       - name: Pull mindbox image back as template builder
         run: docker pull ${{ steps.img.outputs.base }}:latest
 
@@ -64,7 +63,6 @@ jobs:
         run: |
           set -e
           SHA=${GITHUB_SHA::7}
-          # Discover every templates/tools-*/template.toml and build it.
           for dir in templates/tools-*; do
             tpl=$(basename "$dir")
             [ -f "$dir/template.toml" ] || continue

@@ -1,5 +1,11 @@
 # Brings up `mindbox` (api-rust + e2b-shim in one container).
 #
+# On startup the mindbox entrypoint ensures every configured template has an
+# `inspect-tpl-tools-<name>:latest` image on the host docker daemon — pulling
+# from `MINDBOX_TEMPLATE_REGISTRY` first, then falling back to a local
+# `template-build`. Override `MINDBOX_TEMPLATE_REGISTRY` for a private
+# registry, or set `MINDBOX_SKIP_TEMPLATE_ENSURE=1` for shim-only setups.
+#
 #   cp .env.example .env  # optional, for registry / TOS integration
 #   docker compose up -d --build
 

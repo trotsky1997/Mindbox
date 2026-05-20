@@ -49,34 +49,14 @@ COPY --from=build /src/target/release/e2b-shim /usr/local/bin/e2b-shim
 COPY --from=build /src/target/release/template-build /usr/local/bin/template-build
 COPY --from=build /src/target/release/tools-rust /opt/inspect-api/tools-rust/target/release/tools-rust
 RUN mkdir -p /var/lib/e2b-shim/registry /var/lib/e2b-shim/sandboxes /opt/inspect-api/templates
-COPY <<'ENTRY' /usr/local/bin/mindbox-entrypoint
-#!/bin/bash
-set -e
-mode="${MINDBOX_MODE:-both}"
-case "$mode" in
-  api)  exec /usr/local/bin/api-rust ;;
-  shim) exec /usr/local/bin/e2b-shim ;;
-  both)
-    /usr/local/bin/api-rust &
-    api_pid=$!
-    : "${E2B_SHIM_UPSTREAM:=http://127.0.0.1:8000}"
-    export E2B_SHIM_UPSTREAM
-    /usr/local/bin/e2b-shim &
-    shim_pid=$!
-    trap 'kill -TERM $api_pid $shim_pid 2>/dev/null; wait' INT TERM
-    wait -n
-    exit_code=$?
-    kill -TERM $api_pid $shim_pid 2>/dev/null
-    wait 2>/dev/null
-    exit $exit_code
-    ;;
-  *) echo "unknown MINDBOX_MODE=$mode (api|shim|both)" >&2; exit 2 ;;
-esac
-ENTRY
-RUN chmod +x /usr/local/bin/mindbox-entrypoint
+COPY templates/ /opt/inspect-api/templates/
+COPY scripts/mindbox-entrypoint.sh /usr/local/bin/mindbox-entrypoint
+COPY scripts/ensure-templates.sh /usr/local/bin/ensure-templates
+RUN chmod +x /usr/local/bin/mindbox-entrypoint /usr/local/bin/ensure-templates
 EXPOSE 8000 8001
 ENV MINDBOX_MODE=both
 ENV PORT=8000
 ENV E2B_SHIM_PORT=8001
 ENV RUST_LOG=info
+ENV MINDBOX_TEMPLATE_REGISTRY=ghcr.io/trotsky1997/mindbox
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/mindbox-entrypoint"]

@@ -78,17 +78,23 @@ is container/page-cache warmup, not fork/CRIU process prewarm.
 
 ## Quick start
 
+The published image contains the controller binaries (`api-rust`, `e2b-shim`)
+and the `template-build` CLI plus default `templates/` config. On startup
+mindbox makes sure every configured template has an
+`inspect-tpl-tools-<name>:latest` image present on the host docker daemon:
+
+1. Skip when the tag already exists locally.
+2. Try `docker pull` from `$MINDBOX_TEMPLATE_REGISTRY/tpl-<name>:latest`
+   (defaults to `ghcr.io/trotsky1997/mindbox`).
+3. Fall back to local `template-build <name>` if the pull does not resolve.
+
+No manual `docker pull` / `docker tag` step is required:
+
 ```bash
 docker run -d --name mindbox \
   -p 8000:8000 -p 8001:8001 \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v $PWD/templates:/opt/inspect-api/templates:ro \
   ghcr.io/trotsky1997/mindbox:latest
-
-# Pull a template image so api-rust can lazy-spawn it
-docker pull ghcr.io/trotsky1997/mindbox/tpl-tools-default:latest
-docker tag  ghcr.io/trotsky1997/mindbox/tpl-tools-default:latest \
-            inspect-tpl-tools-tools-default:latest
 
 # Use the API
 curl -s -X POST http://127.0.0.1:8000/v2/sessions \
@@ -100,6 +106,11 @@ curl -s -X POST http://127.0.0.1:8000/v2/sessions/<sid>/tools/bash \
   -H 'Content-Type: application/json' \
   -d '{"command":"echo hi"}'
 ```
+
+Override `MINDBOX_TEMPLATE_REGISTRY` to point at a private registry, or set
+`MINDBOX_SKIP_TEMPLATE_ENSURE=1` for shim-only deployments without a docker
+socket. Mount a custom `templates/` directory at
+`/opt/inspect-api/templates` to override the bundled defaults.
 
 ## Tool API
 
