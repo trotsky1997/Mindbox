@@ -318,6 +318,83 @@ async fn materialize_volume_mounts(
     Ok(())
 }
 
+/// If `abs_path` (an absolute path inside the sandbox, e.g.
+/// "/tmp/workspace/mounted/foo.txt") falls under one of the sandbox's
+/// volume mount roots, return `(mount_name, relative_path_inside_volume)`.
+/// The `mount_name` is resolved against state.volumes to the actual
+/// volume_id by callers.
+fn volume_mirror_for(rec: &SandboxRec, abs_path: &str) -> Option<(String, String)> {
+    let norm = if abs_path.starts_with('/') {
+        abs_path.to_string()
+    } else {
+        format!("/{abs_path}")
+    };
+    let mut mounts: Vec<&SandboxVolumeMount> = rec.volume_mounts.iter().collect();
+    mounts.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+    for mount in mounts {
+        let root = mount.path.trim_end_matches('/');
+        if root.is_empty() {
+            continue;
+        }
+        if norm == root || norm.starts_with(&format!("{root}/")) {
+            let rel = norm[root.len()..].trim_start_matches('/').to_string();
+            return Some((mount.name.clone(), rel));
+        }
+    }
+    None
+}
+
+/// Mirror a write that happened on session cwd back to its owning volume.
+/// Best-effort: failures here log but do not fail the originating write.
+fn mirror_write_to_volume(state: &AppState, rec: &SandboxRec, abs_path: &str, bytes: &[u8]) {
+    let Some((name, rel)) = volume_mirror_for(rec, abs_path) else {
+        return;
+    };
+    let vid = state
+        .volumes
+        .iter()
+        .find(|r| r.value().volume_id == name || r.value().name == name)
+        .map(|r| r.value().volume_id.clone());
+    let Some(vid) = vid else {
+        eprintln!("[mirror] volume {name} not found; dropping mirror write");
+        return;
+    };
+    let target = volume_path(&vid, &rel);
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&target, bytes) {
+        eprintln!(
+            "[mirror] write {} bytes to volume {} path {}: {}",
+            bytes.len(),
+            vid,
+            rel,
+            e
+        );
+    }
+}
+
+/// Mirror a delete on session cwd back to its owning volume. Best-effort.
+fn mirror_delete_from_volume(state: &AppState, rec: &SandboxRec, abs_path: &str) {
+    let Some((name, rel)) = volume_mirror_for(rec, abs_path) else {
+        return;
+    };
+    let vid = state
+        .volumes
+        .iter()
+        .find(|r| r.value().volume_id == name || r.value().name == name)
+        .map(|r| r.value().volume_id.clone());
+    let Some(vid) = vid else {
+        return;
+    };
+    let target = volume_path(&vid, &rel);
+    if target.is_dir() {
+        let _ = std::fs::remove_dir_all(&target);
+    } else {
+        let _ = std::fs::remove_file(&target);
+    }
+}
+
 fn rewrite_command_mount_paths(state: &AppState, sid: Option<&str>, command: String) -> String {
     let Some(sid) = sid else {
         return command;
@@ -1288,6 +1365,12 @@ async fn fs_remove(
         Some(r) => r,
         None => return (StatusCode::BAD_REQUEST, "decode").into_response(),
     };
+    // Mirror delete back to any owning volume before we touch the host fs.
+    if let Ok(sid) = pick_sandbox_id(&state, &headers) {
+        if let Some(rec) = state.sandboxes.get(&sid) {
+            mirror_delete_from_volume(&state, &rec, &req.path);
+        }
+    }
     let path = match resolve_path(&state, &headers, &req.path) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -1417,6 +1500,12 @@ async fn files_post(
             .await
             {
                 Ok(_) => {
+                    // B+C hybrid mount: if the path falls under a volume
+                    // mount root, also mirror the write to the volume's
+                    // host directory so the volume content stays in sync.
+                    if let Some(rec) = state.sandboxes.get(&sid) {
+                        mirror_write_to_volume(&state, &rec, &q.path, &payload_for_tools);
+                    }
                     let resp = serde_json::json!([{
                         "name": rel.rsplit('/').next().unwrap_or(""),
                         "type": "file",
@@ -3114,6 +3203,95 @@ mod tests {
         assert_eq!(
             effective_template_id("tools-python-dev"),
             "tools-python-dev"
+        );
+    }
+
+    fn make_rec_with_mount(name: &str, path: &str) -> SandboxRec {
+        SandboxRec {
+            sandbox_id: "s".into(),
+            template_id: "t".into(),
+            client_id: "c".into(),
+            domain: None,
+            envd_version: "0.5.0".into(),
+            envd_access_token: None,
+            alias: None,
+            metadata: None,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            end_at: "".into(),
+            cpu_count: 2,
+            memory_mb: 1024,
+            disk_size_mb: 4096,
+            state: "running".into(),
+            volume_mounts: vec![SandboxVolumeMount {
+                name: name.into(),
+                path: path.into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn volume_mirror_for_matches_under_root() {
+        let rec = make_rec_with_mount("vol1", "/tmp/workspace/mounted");
+        // exact root
+        assert_eq!(
+            volume_mirror_for(&rec, "/tmp/workspace/mounted"),
+            Some(("vol1".into(), "".into()))
+        );
+        // child
+        assert_eq!(
+            volume_mirror_for(&rec, "/tmp/workspace/mounted/foo.txt"),
+            Some(("vol1".into(), "foo.txt".into()))
+        );
+        assert_eq!(
+            volume_mirror_for(&rec, "/tmp/workspace/mounted/a/b/c"),
+            Some(("vol1".into(), "a/b/c".into()))
+        );
+    }
+
+    #[test]
+    fn volume_mirror_for_misses_outside() {
+        let rec = make_rec_with_mount("vol1", "/tmp/workspace/mounted");
+        assert_eq!(volume_mirror_for(&rec, "/tmp/workspace/other"), None);
+        assert_eq!(volume_mirror_for(&rec, "/etc/passwd"), None);
+        // sibling prefix not a child
+        assert_eq!(volume_mirror_for(&rec, "/tmp/workspace/mountedX/foo"), None);
+    }
+
+    #[test]
+    fn volume_mirror_for_longest_mount_wins() {
+        let rec = SandboxRec {
+            sandbox_id: "s".into(),
+            template_id: "t".into(),
+            client_id: "c".into(),
+            domain: None,
+            envd_version: "0.5.0".into(),
+            envd_access_token: None,
+            alias: None,
+            metadata: None,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            end_at: "".into(),
+            cpu_count: 2,
+            memory_mb: 1024,
+            disk_size_mb: 4096,
+            state: "running".into(),
+            volume_mounts: vec![
+                SandboxVolumeMount {
+                    name: "outer".into(),
+                    path: "/tmp/workspace".into(),
+                },
+                SandboxVolumeMount {
+                    name: "inner".into(),
+                    path: "/tmp/workspace/mounted".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            volume_mirror_for(&rec, "/tmp/workspace/mounted/foo"),
+            Some(("inner".into(), "foo".into()))
+        );
+        assert_eq!(
+            volume_mirror_for(&rec, "/tmp/workspace/other.txt"),
+            Some(("outer".into(), "other.txt".into()))
         );
     }
 }
