@@ -46,9 +46,33 @@ pub struct AppState {
     /// chroot_root so the daemon-side filesystem operations and the
     /// chroot-side bash view see the same files (via the same inodes).
     chroot_root: Option<PathBuf>,
-    sessions: DashMap<String, PathBuf>,
+    sessions: DashMap<String, Arc<SessionState>>,
     isolation: IsolationCfg,
     seccomp_filter: Option<Arc<seccompiler::BpfProgram>>,
+}
+
+/// Per-session daemon-side state. A session is the lifetime anchor for
+/// everything spawned during one agent task: its sandbox cwd, its last
+/// touched timestamp (future: idle reaper), and (future: process tool)
+/// its set of long-lived child processes. Dropping the `Arc<SessionState>`
+/// is what frees session-owned resources.
+pub struct SessionState {
+    pub cwd: PathBuf,
+    pub last_touched: std::sync::Mutex<std::time::Instant>,
+}
+
+impl SessionState {
+    fn new(cwd: PathBuf) -> Self {
+        Self {
+            cwd,
+            last_touched: std::sync::Mutex::new(std::time::Instant::now()),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn touch(&self) {
+        *self.last_touched.lock().unwrap() = std::time::Instant::now();
+    }
 }
 
 /// Which optional isolation layers to apply on bash subprocess spawn.
@@ -586,7 +610,7 @@ fn resolve_in(cwd: &StdPath, rel: &str) -> Result<PathBuf, (StatusCode, String)>
 fn resolve_session<'a>(
     state: &'a AppState,
     sid: &str,
-) -> Result<dashmap::mapref::one::Ref<'a, String, PathBuf>, (StatusCode, String)> {
+) -> Result<dashmap::mapref::one::Ref<'a, String, Arc<SessionState>>, (StatusCode, String)> {
     state
         .sessions
         .get(sid)
@@ -739,7 +763,9 @@ async fn create_session(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}")))?;
     let _ = create_session_cgroup(&state.isolation, &id);
-    state.sessions.insert(id.clone(), cwd.clone());
+    state
+        .sessions
+        .insert(id.clone(), Arc::new(SessionState::new(cwd.clone())));
     Ok(Json(CreateSessionResp {
         session_id: id,
         cwd: cwd.to_string_lossy().into_owned(),
@@ -750,10 +776,10 @@ async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let Some((_, cwd)) = state.sessions.remove(&id) else {
+    let Some((_, session)) = state.sessions.remove(&id) else {
         return Err((StatusCode::NOT_FOUND, format!("session {id} not found")));
     };
-    let _ = tokio::fs::remove_dir_all(&cwd).await; // best-effort cleanup
+    let _ = tokio::fs::remove_dir_all(&session.cwd).await; // best-effort cleanup
     if let Some(root) = state.isolation.cgroup_root.as_ref() {
         cleanup_session_cgroup(&root.join(format!("mindbox-{}", id)));
     }
@@ -765,7 +791,7 @@ async fn tool_read(
     Path(sid): Path<String>,
     Json(req): Json<ReadReq>,
 ) -> Result<Json<ReadResp>, (StatusCode, String)> {
-    let cwd = resolve_session(&state, &sid)?.clone();
+    let cwd = resolve_session(&state, &sid)?.cwd.clone();
     let target = resolve_in(&cwd, &req.path)?;
     let bytes = tokio::fs::read(&target)
         .await
@@ -789,7 +815,7 @@ async fn tool_write(
     Path(sid): Path<String>,
     Json(req): Json<WriteReq>,
 ) -> Result<Json<WriteResp>, (StatusCode, String)> {
-    let cwd = resolve_session(&state, &sid)?.clone();
+    let cwd = resolve_session(&state, &sid)?.cwd.clone();
     let target = resolve_in(&cwd, &req.path)?;
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent)
@@ -809,7 +835,7 @@ async fn tool_ls(
     Path(sid): Path<String>,
     Json(req): Json<LsReq>,
 ) -> Result<Json<LsResp>, (StatusCode, String)> {
-    let cwd = resolve_session(&state, &sid)?.clone();
+    let cwd = resolve_session(&state, &sid)?.cwd.clone();
     let target = resolve_in(&cwd, &req.path)?;
     let mut rd = tokio::fs::read_dir(&target)
         .await
@@ -851,7 +877,7 @@ async fn tool_edit(
     Path(sid): Path<String>,
     Json(req): Json<EditReq>,
 ) -> Result<Json<EditResp>, (StatusCode, String)> {
-    let cwd = resolve_session(&state, &sid)?.clone();
+    let cwd = resolve_session(&state, &sid)?.cwd.clone();
     let target = resolve_in(&cwd, &req.path)?;
     let src = tokio::fs::read_to_string(&target)
         .await
@@ -868,7 +894,7 @@ async fn tool_grep(
     Path(sid): Path<String>,
     Json(req): Json<GrepReq>,
 ) -> Result<Json<GrepResp>, (StatusCode, String)> {
-    let cwd = resolve_session(&state, &sid)?.clone();
+    let cwd = resolve_session(&state, &sid)?.cwd.clone();
     let target = resolve_in(&cwd, &req.path)?;
 
     let want_content = req.output_mode == "content";
@@ -1070,7 +1096,7 @@ async fn tool_find(
     Path(sid): Path<String>,
     Json(req): Json<FindReq>,
 ) -> Result<Json<FindResp>, (StatusCode, String)> {
-    let cwd = resolve_session(&state, &sid)?.clone();
+    let cwd = resolve_session(&state, &sid)?.cwd.clone();
     let target = resolve_in(&cwd, &req.path)?;
     let glob = globset::Glob::new(&req.pattern)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad glob: {e}")))?
@@ -1114,18 +1140,25 @@ async fn tool_find(
     }))
 }
 
-async fn tool_bash(
-    State(state): State<Arc<AppState>>,
-    Path(sid): Path<String>,
-    Json(req): Json<BashReq>,
-) -> Result<Json<BashResp>, (StatusCode, String)> {
-    let cwd = resolve_session(&state, &sid)?.clone();
-    let mut cmd = Command::new("/bin/bash");
-    cmd.arg("-c").arg(&req.command);
-    cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
+/// Build a `tokio::process::Command` configured with the daemon's
+/// session sandbox layers (chroot, seccomp, cwd) but with stdin/stdout/stderr
+/// left for the caller to configure. Used by both `tool_bash` (one-shot
+/// child) and the eighth `process` tool (long-lived child). Spawn,
+/// timeout, and cgroup-attach happen in the caller because they differ
+/// between one-shot and long-lived semantics.
+fn build_sandboxed_command(
+    state: &AppState,
+    sid: &str,
+    session_cwd: &StdPath,
+    program: &str,
+    args: &[&str],
+) -> Result<Command, (StatusCode, String)> {
+    let mut cmd = Command::new(program);
+    if !args.is_empty() {
+        cmd.args(args);
+    }
+    cmd.kill_on_drop(true);
+
     // chroot path: don't set current_dir() — pre_exec chroots first and
     // then chdirs to the in-chroot session path. Without chroot, set
     // current_dir() to the daemon-side cwd as before.
@@ -1139,10 +1172,11 @@ async fn tool_bash(
                 Some((rootfs_c, cwd_in_chroot))
             }
             None => {
-                cmd.current_dir(&cwd);
+                cmd.current_dir(session_cwd);
                 None
             }
         };
+
     let filter = state.seccomp_filter.clone();
     if chroot_data.is_some() || filter.is_some() {
         // SAFETY: pre_exec runs post-fork, pre-execve. The operations we
@@ -1160,6 +1194,20 @@ async fn tool_bash(
             });
         }
     }
+    Ok(cmd)
+}
+
+async fn tool_bash(
+    State(state): State<Arc<AppState>>,
+    Path(sid): Path<String>,
+    Json(req): Json<BashReq>,
+) -> Result<Json<BashResp>, (StatusCode, String)> {
+    let cwd = resolve_session(&state, &sid)?.cwd.clone();
+    let mut cmd = build_sandboxed_command(&state, &sid, &cwd, "/bin/bash", &["-c", &req.command])?;
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null());
+
     let timeout = Duration::from_secs(req.timeout.clamp(1, 300));
     let cgroup_dir = state
         .isolation
@@ -1425,7 +1473,9 @@ mod tests {
         let sid = "test-sid".to_string();
         let cwd = state.sandbox_root.join(&sid);
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        state.sessions.insert(sid.clone(), cwd);
+        state
+            .sessions
+            .insert(sid.clone(), Arc::new(SessionState::new(cwd)));
 
         let resp = tool_write(
             State(state.clone()),
@@ -1463,7 +1513,9 @@ mod tests {
         tokio::fs::write(cwd.join("lines.txt"), "one\ntwo\nthree\nfour\n")
             .await
             .unwrap();
-        state.sessions.insert(sid.clone(), cwd);
+        state
+            .sessions
+            .insert(sid.clone(), Arc::new(SessionState::new(cwd)));
 
         let read = tool_read(
             State(state.clone()),
@@ -1500,7 +1552,9 @@ mod tests {
         let cwd = state.sandbox_root.join(&sid);
         tokio::fs::create_dir_all(&cwd).await.unwrap();
         tokio::fs::write(cwd.join("marker"), "x").await.unwrap();
-        state.sessions.insert(sid.clone(), cwd);
+        state
+            .sessions
+            .insert(sid.clone(), Arc::new(SessionState::new(cwd)));
 
         let resp = tool_bash(
             State(state),
@@ -1523,7 +1577,9 @@ mod tests {
         let sid = "timeout-sid".to_string();
         let cwd = state.sandbox_root.join(&sid);
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        state.sessions.insert(sid.clone(), cwd);
+        state
+            .sessions
+            .insert(sid.clone(), Arc::new(SessionState::new(cwd)));
 
         let resp = tool_bash(
             State(state),
@@ -1618,7 +1674,9 @@ mod tests {
     async fn make_sid(state: &Arc<AppState>, name: &str) -> String {
         let cwd = state.sandbox_root.join(name);
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        state.sessions.insert(name.to_string(), cwd);
+        state
+            .sessions
+            .insert(name.to_string(), Arc::new(SessionState::new(cwd)));
         name.to_string()
     }
 
@@ -1626,7 +1684,7 @@ mod tests {
     async fn ls_lists_files_and_dirs() {
         let (_td, state) = tmp_state();
         let sid = make_sid(&state, "ls-sid").await;
-        let cwd = state.sessions.get(&sid).unwrap().clone();
+        let cwd = state.sessions.get(&sid).unwrap().cwd.clone();
         tokio::fs::write(cwd.join("a.txt"), "x").await.unwrap();
         tokio::fs::create_dir_all(cwd.join("sub")).await.unwrap();
         let resp = tool_ls(
@@ -1651,7 +1709,7 @@ mod tests {
     async fn ls_respects_limit_after_sorting() {
         let (_td, state) = tmp_state();
         let sid = make_sid(&state, "ls-limit-sid").await;
-        let cwd = state.sessions.get(&sid).unwrap().clone();
+        let cwd = state.sessions.get(&sid).unwrap().cwd.clone();
         tokio::fs::write(cwd.join("b.txt"), "").await.unwrap();
         tokio::fs::write(cwd.join("a.txt"), "").await.unwrap();
         let resp = tool_ls(
@@ -1672,7 +1730,7 @@ mod tests {
     async fn edit_single_occurrence() {
         let (_td, state) = tmp_state();
         let sid = make_sid(&state, "edit-sid").await;
-        let cwd = state.sessions.get(&sid).unwrap().clone();
+        let cwd = state.sessions.get(&sid).unwrap().cwd.clone();
         tokio::fs::write(cwd.join("f.txt"), "alpha beta gamma")
             .await
             .unwrap();
@@ -1701,7 +1759,7 @@ mod tests {
     async fn edit_applies_multiple_replacements_against_original() {
         let (_td, state) = tmp_state();
         let sid = make_sid(&state, "edit-multi-sid").await;
-        let cwd = state.sessions.get(&sid).unwrap().clone();
+        let cwd = state.sessions.get(&sid).unwrap().cwd.clone();
         tokio::fs::write(cwd.join("f.txt"), "alpha beta gamma delta")
             .await
             .unwrap();
@@ -1736,7 +1794,7 @@ mod tests {
     async fn edit_rejects_overlapping_canonical_replacements() {
         let (_td, state) = tmp_state();
         let sid = make_sid(&state, "edit-overlap-sid").await;
-        let cwd = state.sessions.get(&sid).unwrap().clone();
+        let cwd = state.sessions.get(&sid).unwrap().cwd.clone();
         tokio::fs::write(cwd.join("f.txt"), "abcdef").await.unwrap();
         let err = tool_edit(
             State(state),
@@ -1766,7 +1824,7 @@ mod tests {
     async fn edit_refuses_ambiguous_without_replace_all() {
         let (_td, state) = tmp_state();
         let sid = make_sid(&state, "edit-amb-sid").await;
-        let cwd = state.sessions.get(&sid).unwrap().clone();
+        let cwd = state.sessions.get(&sid).unwrap().cwd.clone();
         tokio::fs::write(cwd.join("f.txt"), "ab ab ab")
             .await
             .unwrap();
@@ -1789,7 +1847,7 @@ mod tests {
     async fn edit_replace_all() {
         let (_td, state) = tmp_state();
         let sid = make_sid(&state, "edit-all-sid").await;
-        let cwd = state.sessions.get(&sid).unwrap().clone();
+        let cwd = state.sessions.get(&sid).unwrap().cwd.clone();
         tokio::fs::write(cwd.join("f.txt"), "ab ab ab")
             .await
             .unwrap();
@@ -1815,7 +1873,7 @@ mod tests {
     async fn grep_content_mode_returns_lines() {
         let (_td, state) = tmp_state();
         let sid = make_sid(&state, "grep-sid").await;
-        let cwd = state.sessions.get(&sid).unwrap().clone();
+        let cwd = state.sessions.get(&sid).unwrap().cwd.clone();
         tokio::fs::write(cwd.join("a.txt"), "hello world\nfoo bar\nhello again\n")
             .await
             .unwrap();
@@ -1845,7 +1903,7 @@ mod tests {
     async fn grep_supports_canonical_filters_and_context() {
         let (_td, state) = tmp_state();
         let sid = make_sid(&state, "grep-canon-sid").await;
-        let cwd = state.sessions.get(&sid).unwrap().clone();
+        let cwd = state.sessions.get(&sid).unwrap().cwd.clone();
         tokio::fs::create_dir_all(cwd.join("src")).await.unwrap();
         tokio::fs::write(
             cwd.join("src/a.txt"),
@@ -1894,7 +1952,7 @@ mod tests {
     async fn grep_files_mode_lists_paths() {
         let (_td, state) = tmp_state();
         let sid = make_sid(&state, "grep-f-sid").await;
-        let cwd = state.sessions.get(&sid).unwrap().clone();
+        let cwd = state.sessions.get(&sid).unwrap().cwd.clone();
         tokio::fs::write(cwd.join("a.txt"), "needle").await.unwrap();
         tokio::fs::write(cwd.join("b.txt"), "haystack")
             .await
@@ -1924,7 +1982,7 @@ mod tests {
     async fn find_glob_matches() {
         let (_td, state) = tmp_state();
         let sid = make_sid(&state, "find-sid").await;
-        let cwd = state.sessions.get(&sid).unwrap().clone();
+        let cwd = state.sessions.get(&sid).unwrap().cwd.clone();
         tokio::fs::create_dir_all(cwd.join("sub")).await.unwrap();
         tokio::fs::write(cwd.join("a.rs"), "").await.unwrap();
         tokio::fs::write(cwd.join("sub/b.rs"), "").await.unwrap();
@@ -1959,7 +2017,7 @@ mod tests {
     async fn find_respects_max_results() {
         let (_td, state) = tmp_state();
         let sid = make_sid(&state, "find-max-sid").await;
-        let cwd = state.sessions.get(&sid).unwrap().clone();
+        let cwd = state.sessions.get(&sid).unwrap().cwd.clone();
         for i in 0..10 {
             tokio::fs::write(cwd.join(format!("f{i}.txt")), "")
                 .await
