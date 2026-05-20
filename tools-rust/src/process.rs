@@ -1623,4 +1623,62 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
+
+    // 7.6 buffer truncation: child writes > buffer cap → next read sets
+    //     truncated:true and contains the newest bytes.
+    #[tokio::test]
+    async fn buffer_truncation_flag_set_on_overflow() {
+        let (td, state) = (tempfile::tempdir().unwrap(), {
+            // need a smaller buffer cap than default; build a custom state
+            let td = tempfile::tempdir().unwrap();
+            Arc::new(AppState {
+                sandbox_root: td.path().to_path_buf(),
+                session_root: td.path().to_path_buf(),
+                chroot_root: None,
+                sessions: DashMap::new(),
+                isolation: IsolationCfg::default(),
+                seccomp_filter: None,
+                process_cfg: ProcessCfg {
+                    enabled: true,
+                    max_per_session: 4,
+                    buffer_bytes: 16, // tiny on purpose
+                    idle_reap_sec: 3600,
+                    kill_group: false,
+                    force_unsupported: false,
+                },
+            })
+        });
+        // The first td above is unused; we built a fresh AppState inline.
+        let _ = td;
+        let cwd = state.sandbox_root.join("s");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        state
+            .sessions
+            .insert("s".to_string(), Arc::new(SessionState::new(cwd)));
+
+        // Print ~200 bytes — exceeds the 16-byte buffer easily.
+        let pid = start_sh(&state, "s", "printf '%s' $(yes ABCDEFGHIJ | head -n 20)").await;
+        let exit = wait_pid(&state, "s", &pid, 3.0).await;
+        assert_eq!(exit.running, Some(false));
+        // Drain task may still be flushing.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let mut r = req(ProcessAction::Read);
+        r.process_id = Some(pid);
+        let resp = tool_process(
+            axum::extract::State(state),
+            axum::extract::Path("s".into()),
+            axum::Json(r),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.0.truncated, Some(true));
+        let stdout = resp.0.stdout.unwrap();
+        // Whatever the prefix was, the *last* 16 chars must be the most
+        // recent bytes the child wrote (a substring of ABCDEFGHIJ repeated).
+        assert!(stdout.len() <= 16);
+        for c in stdout.chars() {
+            assert!("ABCDEFGHIJ".contains(c), "unexpected byte: {c:?}");
+        }
+    }
 }

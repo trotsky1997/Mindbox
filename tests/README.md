@@ -21,10 +21,10 @@ cargo test --workspace --all-targets
 
 | Crate | Coverage |
 |---|---|
-| `api-rust` | template loading, warmup config/result helpers, memory parsing, PagedRegistry state transitions |
+| `api-rust` | template loading, warmup config/result helpers, memory parsing, PagedRegistry state transitions, TOOLS_EXPOSE_PROCESS forward gate |
 | `e2b-shim` | E2B-compatible request/response helpers, Connect envelopes, path/body parsing |
 | `template-builder` | template config/warmup parsing and image-name logic |
-| `tools-rust` | session path validation, seven-tool schemas, read/write/edit/ls/grep/find/bash behavior, isolation helpers |
+| `tools-rust` | session path validation, seven-tool schemas, read/write/edit/ls/grep/find/bash behavior, isolation helpers, eighth `process` tool (start/read/write/wait/signal/stop/list, session-scoped lifecycle, ring-buffer truncation, daemon kill switch, force-unsupported) |
 
 ## Integration testing
 
@@ -39,4 +39,5 @@ as unit tests. Useful smoke coverage is:
 5. Exercise all seven `/v2/sessions/:sid/tools/:tool` endpoints with canonical request bodies.
 6. For warmup, add a temporary `[warmup]` command to a template and confirm logs show health, warmup success, then `COLD→HOT`.
 7. Test a failing warmup command and confirm the failed container is removed instead of registered Hot.
-8. Optionally verify `e2b-shim` with `commands.run`, `files.read`, and `files.write`.
+8. For the eighth `process` tool: set `TOOLS_PROCESS_ENABLED=1` on `tools-rust` and `TOOLS_EXPOSE_PROCESS=1` on `api-rust`, then exercise `start → read → wait → list → stop` against `tools-default` and confirm `DELETE /v2/sessions/:sid` reaps any leftover processes.
+9. Optionally verify `e2b-shim` with `commands.run`, `files.read`, and `files.write`.
